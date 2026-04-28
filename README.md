@@ -38,8 +38,8 @@ pip install -e .
 bash scripts/build_all.sh
 
 # 4. Serve vLLM (terminal 1) and tool server (terminal 2)
-bash scripts/serve_vllm.sh
-bash scripts/serve_tool.sh
+bash scripts/serve_vllm.sh # using venv: source ../matreshka_reranker/.venv/bin/activate
+bash scripts/serve_tool.sh # using home venv 
 
 # 5. Run baseline + agent eval
 bash scripts/run_eval.sh
