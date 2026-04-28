@@ -70,7 +70,7 @@ def run_agent_eval(
                 top_k_default=cfg["index"].get("top_k_default", 10),
             )
             try:
-                result = harness.run(agent_input)
+                result = harness.run(agent_input, gold_doc_ids=row["gold_doc_ids"])
             except Exception as e:
                 log.exception("agent run failed for %s", row["question_id"])
                 stop_counts["error"] = stop_counts.get("error", 0) + 1
@@ -86,9 +86,9 @@ def run_agent_eval(
             if i % max(1, check_every) == 0:
                 maybe_check_consistency(result.trajectory)
 
-            stop_counts[result.stopped_reason] = stop_counts.get(
-                result.stopped_reason, 0
-            ) + 1
+            stop_counts[result.stopped_reason] = (
+                stop_counts.get(result.stopped_reason, 0) + 1
+            )
 
             gold = set(row["gold_doc_ids"])
             k = cfg["eval"]["ndcg_k"]
@@ -100,8 +100,9 @@ def run_agent_eval(
                     "predicted": result.ranked_doc_ids,
                     "gold_doc_ids": row["gold_doc_ids"],
                     "ndcg": m.ndcg,
-                    "recall": m.recall,
                     "precision": m.precision,
+                    "recall": m.recall,
+                    "f1": m.f1,
                     "num_turns": result.trajectory.num_turns,
                     "num_tool_calls": result.trajectory.num_tool_calls,
                     "stopped_reason": result.stopped_reason,
@@ -117,8 +118,9 @@ def run_agent_eval(
         "top_k": cfg["eval"]["ndcg_k"],
         "max_tool_calls": max_tool_calls or cfg["agent"]["max_tool_calls"],
         "ndcg": agg.ndcg,
-        "recall": agg.recall,
         "precision": agg.precision,
+        "recall": agg.recall,
+        "f1": agg.f1,
         "stopped_reason_counts": stop_counts,
         "avg_turns": (
             sum(p.get("num_turns", 0) for p in per_example) / max(1, len(per_example))
@@ -167,12 +169,13 @@ def main() -> None:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         Path(args.out).write_text(json.dumps(summary, indent=2, ensure_ascii=False))
         log.info(
-            "agent n=%d  ndcg@%d=%.4f  recall@%d=%.4f  avg_calls=%.2f",
+            "agent n=%d  ndcg@%d=%.4f  precision=%.4f  recall=%.4f  f1=%.4f  avg_calls=%.2f",
             summary["n"],
             summary["top_k"],
             summary["ndcg"],
-            summary["top_k"],
+            summary["precision"],
             summary["recall"],
+            summary["f1"],
             summary["avg_tool_calls"],
         )
 

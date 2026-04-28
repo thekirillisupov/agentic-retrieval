@@ -93,6 +93,7 @@ class Trajectory:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    gold_doc_ids: list[str] = field(default_factory=list)
 
 
 StoppedReason = Literal["answer", "max_turns", "max_tool_calls", "parse_error"]

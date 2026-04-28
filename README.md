@@ -55,3 +55,9 @@ there. The agent harness, tool server, and indexing scripts all read it.
 Every rollout writes a JSON file under `trajectories_data/` with the full message
 history, tool calls, and token counts. Format is designed to drop straight into
 veRL/Search-R1-style RL pipelines later — see `trajectories/writer.py`.
+
+## Experiments
+
+enable_thinking=false agent n=200 ndcg@10=0.4750 recall@10=0.4275 avg_calls=2.88
+enable_thinking=true agent n=200  ndcg@10=0.3960  recall@10=0.3800  avg_calls=2.13
+enable_thinking=false and <think> tag

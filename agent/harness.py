@@ -78,7 +78,7 @@ class AgentHarness:
         self.top_k_default = top_k_default
         self.top_k_max = top_k_max
 
-    def run(self, agent_input: AgentInput) -> AgentOutput:
+    def run(self, agent_input: AgentInput, *, gold_doc_ids: list[str] | None = None) -> AgentOutput:
         system_prompt = get_prompt(self.prompt_version)
 
         # The harness owns the system message; caller passes only the conversation.
@@ -188,6 +188,7 @@ class AgentHarness:
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
+            gold_doc_ids=gold_doc_ids or [],
         )
 
         return AgentOutput(
@@ -271,7 +272,7 @@ class AgentHarness:
             arguments=args,
             result_summary={
                 "num_results": len(results),
-                "top_doc_ids": [r["doc_id"] for r in results[:5]],
+                "top_doc_ids": [r["doc_id"] for r in results],
             },
             latency_ms=latency_ms,
         )

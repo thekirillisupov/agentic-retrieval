@@ -55,8 +55,9 @@ def run(
                     "predicted": predicted,
                     "gold_doc_ids": row["gold_doc_ids"],
                     "ndcg": m.ndcg,
-                    "recall": m.recall,
                     "precision": m.precision,
+                    "recall": m.recall,
+                    "f1": m.f1,
                 }
             )
     finally:
@@ -67,8 +68,9 @@ def run(
         "n": len(metrics),
         "top_k": top_k,
         "ndcg": agg.ndcg,
-        "recall": agg.recall,
         "precision": agg.precision,
+        "recall": agg.recall,
+        "f1": agg.f1,
         "per_example": per_example,
     }
 
@@ -100,12 +102,14 @@ def main() -> None:
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(json.dumps(summary, indent=2, ensure_ascii=False))
     log.info(
-        "baseline n=%d top_k=%d  ndcg@k=%.4f  recall@k=%.4f  precision@k=%.4f",
+        "baseline n=%d top_k=%d  ndcg@%d=%.4f  precision=%.4f  recall=%.4f  f1=%.4f",
         summary["n"],
         summary["top_k"],
+        summary["top_k"],
         summary["ndcg"],
-        summary["recall"],
         summary["precision"],
+        summary["recall"],
+        summary["f1"],
     )
 
 

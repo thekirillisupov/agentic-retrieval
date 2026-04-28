@@ -34,6 +34,7 @@ def trajectory_to_dict(t: Trajectory) -> dict[str, Any]:
         "tool_calls": [dataclasses.asdict(tc) for tc in t.tool_calls],
         "output": {
             "ranked_doc_ids": t.ranked_doc_ids,
+            "gold_doc_ids": t.gold_doc_ids,
             "stopped_reason": t.stopped_reason,
             "num_turns": t.num_turns,
             "num_tool_calls": t.num_tool_calls,

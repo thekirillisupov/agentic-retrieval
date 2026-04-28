@@ -40,6 +40,7 @@ def build(raw_dir: Path, processed_dir: Path, out_path: Path) -> int:
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     n_written = 0
+    n_skipped = 0
     n_missing = 0
     with dev_path.open("r", encoding="utf-8") as fin, out_path.open("w", encoding="utf-8") as fout:
         for line in fin:
@@ -47,6 +48,9 @@ def build(raw_dir: Path, processed_dir: Path, out_path: Path) -> int:
             if not line:
                 continue
             example = json.loads(line)
+            if not example.get("answerable", True):
+                n_skipped += 1
+                continue
             qid = example["id"]
             gold: list[str] = []
             for p in example["paragraphs"]:
@@ -69,8 +73,10 @@ def build(raw_dir: Path, processed_dir: Path, out_path: Path) -> int:
             fout.write(json.dumps(record, ensure_ascii=False) + "\n")
             n_written += 1
 
-    log.info("wrote %d eval examples to %s (%d missing source-id mappings)",
-             n_written, out_path, n_missing)
+    log.info(
+        "wrote %d eval examples to %s (%d unanswerable skipped, %d missing source-id mappings)",
+        n_written, out_path, n_skipped, n_missing,
+    )
     return n_written
 
 

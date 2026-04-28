@@ -14,25 +14,29 @@ from dataclasses import dataclass
 @dataclass
 class MetricResult:
     ndcg: float
-    recall: float
     precision: float
+    recall: float
+    f1: float
 
 
-def precision_at_k(predicted: list[str], gold: set[str], k: int) -> float:
-    if k <= 0:
+def simple_precision(predicted: list[str], gold: set[str]) -> float:
+    if not predicted:
         return 0.0
-    topk = predicted[:k]
-    if not topk:
-        return 0.0
-    hits = sum(1 for p in topk if p in gold)
-    return hits / k
+    hits = sum(1 for p in predicted if p in gold)
+    return hits / len(predicted)
 
 
-def recall_at_k(predicted: list[str], gold: set[str], k: int) -> float:
+def simple_recall(predicted: list[str], gold: set[str]) -> float:
     if not gold:
         return 0.0
-    hits = sum(1 for p in predicted[:k] if p in gold)
+    hits = sum(1 for p in predicted if p in gold)
     return hits / len(gold)
+
+
+def simple_f1(precision: float, recall: float) -> float:
+    if precision + recall == 0.0:
+        return 0.0
+    return 2 * precision * recall / (precision + recall)
 
 
 def dcg_at_k(predicted: list[str], gold: set[str], k: int) -> float:
@@ -57,22 +61,24 @@ def ndcg_at_k(predicted: list[str], gold: set[str], k: int) -> float:
     return dcg_at_k(predicted, gold, k) / idcg
 
 
-def evaluate_one(
-    predicted: list[str], gold: set[str], k: int = 10
-) -> MetricResult:
+def evaluate_one(predicted: list[str], gold: set[str], k: int = 10) -> MetricResult:
+    p = simple_precision(predicted, gold)
+    r = simple_recall(predicted, gold)
     return MetricResult(
         ndcg=ndcg_at_k(predicted, gold, k),
-        recall=recall_at_k(predicted, gold, k),
-        precision=precision_at_k(predicted, gold, k),
+        precision=p,
+        recall=r,
+        f1=simple_f1(p, r),
     )
 
 
 def aggregate(results: list[MetricResult]) -> MetricResult:
     if not results:
-        return MetricResult(0.0, 0.0, 0.0)
+        return MetricResult(0.0, 0.0, 0.0, 0.0)
     n = len(results)
     return MetricResult(
         ndcg=sum(r.ndcg for r in results) / n,
-        recall=sum(r.recall for r in results) / n,
         precision=sum(r.precision for r in results) / n,
+        recall=sum(r.recall for r in results) / n,
+        f1=sum(r.f1 for r in results) / n,
     )
