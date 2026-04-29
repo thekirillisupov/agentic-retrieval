@@ -1,0 +1,5 @@
+# veRL AgentLoop registry. Each entry maps `agent_name` (set per-row in the
+# parquet) to a Python class. veRL imports the module, then instantiates the
+# class via init_class(config, tokenizer).
+- name: retrieval_react
+  _target_: grpo.agent_loop.RetrievalReActAgentLoop

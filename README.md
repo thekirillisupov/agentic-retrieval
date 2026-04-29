@@ -17,10 +17,11 @@ See the technical specification for the full architectural rationale.
 agent/           ReAct loop, prompts, schemas, parser
 tool_server/     FastAPI app: /local_search, /healthz, /stats
 indexing/        corpus parsers (MuSiQue, SBOL) + faiss index builder
-eval_/           NDCG@k, Recall@k; single-shot baseline; agent eval
+eval_/           NDCG@k, Recall@k; single-shot baseline; agent eval; train-set builder
 trajectories/    JSON trace writer + TI/TO consistency check
-configs/         per-dataset configs (default.yaml = MuSiQue, sbol.yaml = SBOL FAQ)
-scripts/         shell wrappers for vLLM, tool server, build, eval
+grpo/            GRPO training: data_prep, AgentLoop, reward, TI/TO check
+configs/         per-dataset configs (default.yaml, sbol.yaml) + grpo_qwen3_14b.yaml
+scripts/         shell wrappers for vLLM, tool server, build, eval, GRPO training
 indexes/         FAISS indexes per dataset (musique/, sbol/)
 data/processed/  processed corpora and eval sets per dataset (musique/, sbol/)
 ```
@@ -67,6 +68,44 @@ and the shell scripts expose a `CONFIG=` env var to switch datasets.
 Every rollout writes a JSON file under `trajectories_data/` with the full message
 history, tool calls, and token counts. Format is designed to drop straight into
 veRL/Search-R1-style RL pipelines later — see `trajectories/writer.py`.
+
+## GRPO training
+
+End-to-end GRPO over the ReAct loop on MuSiQue train. Reward = NDCG@10 against
+the gold supporting passages, with a one-sided length penalty layered on top.
+
+```bash
+# 1. Install the verl extras (pulls in ray, hydra, vllm, ...)
+pip install -e .[verl]
+
+# 2. Build the parquet (parses MuSiQue train + writes grpo_{train,val}.parquet)
+bash scripts/build_grpo_data.sh
+
+# 3. Start the tool server (FAISS + E5 embedder)
+bash scripts/serve_tool.sh
+
+# 4. Launch training (8x GPU). The actor's rollout server is internal to veRL —
+#    don't start scripts/serve_vllm.sh for training.
+bash scripts/train_grpo.sh
+```
+
+Knobs called out by the spec:
+
+| Concern | Where |
+|---|---|
+| **Reward = NDCG@k** | `grpo/reward.py` reuses `eval_.metrics.ndcg_at_k`. |
+| **Length normalisation** | `actor.loss_agg_mode=token-mean` + per-token reward penalty (`length_alpha`). |
+| **Group size G** | `actor_rollout_ref.rollout.n=8`. |
+| **Zero-variance filtering** | `algorithm.filter_groups.enable=true, metric=score`. |
+| **TI/TO consistency** | `grpo/ti_to_check.py` re-templates `messages_full` and diffs against `prompt_ids+response_ids`; sampled every `ti_to_check.every_n_steps`. |
+| **Initial model** | `Qwen/Qwen3-14B` at `actor_rollout_ref.model.path`. |
+| **Framework** | veRL (`verl.trainer.main_ppo`) with custom AgentLoop. |
+
+The custom AgentLoop (`grpo/agent_loop.py`, `name=retrieval_react`) drives the
+ReAct rollout: each turn it (a) generates with the in-process rollout server,
+(b) parses Qwen3-XML tool calls, (c) hits the tool server, (d) re-templates the
+new tool messages and extends `response_mask` with 0s so the optimiser only
+takes credit for tokens the actor itself produced.
 
 ## Experiments
 

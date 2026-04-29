@@ -35,10 +35,16 @@ gpu = [
 serve = [
     "vllm>=0.4",
 ]
+verl = [
+    # GRPO training stack. veRL pulls in ray, hydra-core, transformers, vllm, etc.
+    "verl>=0.4",
+    "pyarrow>=14",
+    "pandas>=2.1",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["agent*", "tool_server*", "indexing*", "eval_*", "trajectories*"]
+include = ["agent*", "tool_server*", "indexing*", "eval_*", "trajectories*", "grpo*"]
 exclude = ["data*", "index*", "trajectories_data*"]
 
 [tool.ruff]
