@@ -1,8 +1,12 @@
-"""E5 embedder wrapper.
+"""Text embedder wrapper.
 
-Encapsulates the `query: ` / `passage: ` prefix discipline. Callers pass plain
-text — the embedder is the only place that knows about prefixes. This means the
-indexing pipeline and the tool server can never accidentally mix conventions.
+Encapsulates prefix discipline and pooling strategy. Callers pass plain text —
+the embedder is the only place that knows about prefixes and pooling. This means
+the indexing pipeline and the tool server can never accidentally mix conventions.
+
+Supported pooling modes:
+  "mean" — weighted average pool over non-padding tokens (E5-family)
+  "cls"  — first [CLS] token (BGE-M3 and most BGE models)
 
 L2-normalization is enforced here too, so the index can use IndexFlatIP and get
 cosine similarity for free.
@@ -11,13 +15,15 @@ cosine similarity for free.
 from __future__ import annotations
 
 import logging
-from typing import Iterable
+from typing import Iterable, Literal
 
 import numpy as np
 import torch
 from transformers import AutoModel, AutoTokenizer
 
 log = logging.getLogger(__name__)
+
+PoolingMode = Literal["mean", "cls"]
 
 
 class E5Embedder:
@@ -29,16 +35,18 @@ class E5Embedder:
         max_length: int = 512,
         query_prefix: str = "query: ",
         passage_prefix: str = "passage: ",
+        pooling: PoolingMode = "mean",
     ) -> None:
         self.name = name
         self.device = device
         self.max_length = max_length
         self.query_prefix = query_prefix
         self.passage_prefix = passage_prefix
+        self.pooling = pooling
 
-        log.info("loading embedder %s on %s", name, device)
+        log.info("loading embedder %s on %s (pooling=%s)", name, device, pooling)
         self.tokenizer = AutoTokenizer.from_pretrained(name)
-        self.model = AutoModel.from_pretrained(name).to(device).eval()
+        self.model = AutoModel.from_pretrained(name, use_safetensors=True).to(device).eval()
 
         with torch.no_grad():
             test = self._encode_texts([self.passage_prefix + "test"])
@@ -73,15 +81,15 @@ class E5Embedder:
             return_tensors="pt",
         ).to(self.device)
         outputs = self.model(**batch)
-        emb = _average_pool(outputs.last_hidden_state, batch["attention_mask"])
+        if self.pooling == "cls":
+            emb = outputs.last_hidden_state[:, 0, :]
+        else:
+            emb = _average_pool(outputs.last_hidden_state, batch["attention_mask"])
         emb = torch.nn.functional.normalize(emb, p=2, dim=1)
         return emb.cpu().numpy().astype(np.float32)
 
     def count_truncated(self, texts: Iterable[str]) -> int:
-        """Count how many passages exceed max_length tokens (without prefix offset).
-
-        Used during indexing to monitor whether E5's 512-token limit is biting.
-        """
+        """Count how many passages exceed max_length tokens (including prefix)."""
         n = 0
         for t in texts:
             ids = self.tokenizer.encode(self.passage_prefix + t, add_special_tokens=True)

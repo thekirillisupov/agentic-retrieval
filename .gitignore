@@ -9,6 +9,7 @@ __pycache__/
 data/raw/
 data/processed/
 index/
+indexes/
 trajectories_data/
 *.faiss
 *.index
@@ -22,4 +23,3 @@ trajectories_data/
 
 # OS
 .DS_Store
-trajectories_data_not_reasoning/

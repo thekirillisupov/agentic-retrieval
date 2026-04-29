@@ -5,7 +5,7 @@ set -euo pipefail
 
 CONFIG="${CONFIG:-configs/default.yaml}"
 RAW_DIR="${RAW_DIR:-data/raw/musique}"
-PROCESSED_DIR="${PROCESSED_DIR:-data/processed}"
+PROCESSED_DIR="${PROCESSED_DIR:-data/processed/musique}"
 
 echo "[1/3] parse MuSiQue"
 python -m indexing.parse_musique --raw-dir "${RAW_DIR}" --out-dir "${PROCESSED_DIR}"

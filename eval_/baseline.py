@@ -79,7 +79,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/default.yaml")
     parser.add_argument("--eval-path", default=None)
-    parser.add_argument("--out", default="data/processed/baseline_results.json")
+    parser.add_argument("--out", default="data/processed/musique/baseline_results.json")
     parser.add_argument("--top-k", type=int, default=None)
     args = parser.parse_args()
 

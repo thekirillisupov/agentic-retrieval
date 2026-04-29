@@ -22,7 +22,7 @@ embedder:
   pooling: "cls"
 
 index:
-  dir: ./indexes/musique/
+  dir: ./indexes/sbol/
   top_k_default: 10
   top_k_max: 50
   use_gpu: false
@@ -32,12 +32,12 @@ index:
 agent:
   max_turns: 8
   max_tool_calls: 10
-  prompt_version: v1
+  prompt_version: v1_ru
 
 eval:
-  raw_musique_dir: ./data/raw/musique/
-  processed_dir: ./data/processed/musique/
-  eval_dataset_path: ./data/processed/musique/musique_dev_eval.jsonl
+  raw_sbol_dir: ./data/raw/sbol/
+  processed_dir: ./data/processed/sbol/
+  eval_dataset_path: ./data/processed/sbol/eval.jsonl
   subset_size: 200
   budget_sweep: [1, 3, 5, 8]
   ndcg_k: 10

@@ -3,7 +3,7 @@
 set -euo pipefail
 
 CONFIG="${CONFIG:-configs/default.yaml}"
-OUT_DIR="${OUT_DIR:-data/processed}"
+OUT_DIR="${OUT_DIR:-data/processed/musique}"
 
 echo "[1/2] single-shot baseline"
 python -m eval_.baseline --config "${CONFIG}" --out "${OUT_DIR}/baseline_results.json"

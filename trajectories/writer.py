@@ -52,8 +52,16 @@ class TrajectoryWriter:
         self.out_dir = out_dir
         self.out_dir.mkdir(parents=True, exist_ok=True)
 
+    def _subfolder(self, trajectory: Trajectory) -> Path:
+        date = trajectory.timestamp[:10] if trajectory.timestamp else "unknown"
+        version = trajectory.prompt_version or "unknown"
+        sub = self.out_dir / date / version
+        sub.mkdir(parents=True, exist_ok=True)
+        return sub
+
     def write(self, trajectory: Trajectory) -> Path:
-        path = self.out_dir / f"{trajectory.trajectory_id}.json"
+        sub = self._subfolder(trajectory)
+        path = sub / f"{trajectory.trajectory_id}.json"
         path.write_text(
             json.dumps(trajectory_to_dict(trajectory), ensure_ascii=False, indent=2)
         )

@@ -83,9 +83,9 @@ def build(raw_dir: Path, processed_dir: Path, out_path: Path) -> int:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--raw-dir", default="data/raw/musique")
-    parser.add_argument("--processed-dir", default="data/processed")
+    parser.add_argument("--processed-dir", default="data/processed/musique")
     parser.add_argument(
-        "--out", default="data/processed/musique_dev_eval.jsonl"
+        "--out", default="data/processed/musique/musique_dev_eval.jsonl"
     )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")

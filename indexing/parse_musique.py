@@ -112,7 +112,7 @@ def parse(raw_dir: Path, out_dir: Path) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--raw-dir", default="data/raw/musique")
-    parser.add_argument("--out-dir", default="data/processed")
+    parser.add_argument("--out-dir", default="data/processed/musique")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")

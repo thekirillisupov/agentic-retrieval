@@ -58,6 +58,7 @@ def create_app(config_path: Path) -> FastAPI:
             max_length=emb_cfg["max_length"],
             query_prefix=emb_cfg["query_prefix"],
             passage_prefix=emb_cfg["passage_prefix"],
+            pooling=emb_cfg.get("pooling", "mean"),
         )
         State.index = FaissIndex.load(
             Path(idx_cfg["dir"]),

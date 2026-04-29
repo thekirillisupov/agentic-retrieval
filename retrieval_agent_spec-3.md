@@ -1,7 +1,7 @@
 # Retrieval Agent MVP — Техническая спецификация
 
 **Статус:** готово к имплементации
-**Цель:** SID-1-like retrieval-агент, возвращающий ранжированный список релевантных документов на диалоговый вход.
+**Цель:** SID-1-like retrieval-агент, возвращающий ранжированный список релевантных документов на диалоговый вход. Поддерживает несколько корпусов (MuSiQue, SBOL FAQ) через раздельные конфиги и индексы.
 **Обучение:** не в этой итерации, но трассы и инфраструктура закладываются так, чтобы потом не переделывать.
 
 ---
@@ -11,7 +11,7 @@
 ### В рамках MVP
 
 - Один режим работы: retrieval (возврат списка `doc_id`, ранжированных по релевантности).
-- Один инструмент: `local_search` над faiss-индексом MuSiQue-корпуса.
+- Один инструмент: `local_search` над faiss-индексом корпуса (MuSiQue или SBOL FAQ, выбирается конфигом).
 - Диалоговый вход: агент отвечает на последний user-turn с учётом истории.
 - Модель: Qwen3.5-35B-A3B через vLLM (fallback: Qwen3.5-27B dense).
 - Оценка: NDCG@10 на MuSiQue dev vs single-shot baseline.
@@ -65,7 +65,9 @@
 
 ## 3. Faiss-индекс
 
-### Корпус
+Каждый датасет живёт в своём подкаталоге: `data/processed/<dataset>/` и `indexes/<dataset>/`. Конфиг (`configs/<dataset>.yaml`) связывает их. Переключение между датасетами — `CONFIG=configs/sbol.yaml bash scripts/serve_tool.sh`.
+
+### Корпус — MuSiQue
 
 **Источник:** MuSiQue (train + dev paragraphs, union), сырые файлы с [официального репо](https://github.com/StonyBrookNLP/musique).
 
@@ -96,7 +98,7 @@ musique_full_v1.0_dev.jsonl
 }
 ```
 
-**Парсер (`indexing/preprocess.py`):**
+**Парсер (`indexing/parse_musique.py`):**
 
 1. Пройти по всем строкам train+dev jsonl, извлечь все `paragraphs` из каждого примера.
 2. Для каждого parag'а сформировать `(title, paragraph_text)` pair.
@@ -107,15 +109,16 @@ musique_full_v1.0_dev.jsonl
 **Выход парсера:**
 
 ```
-data/processed/
+data/processed/musique/
   corpus.jsonl              # {doc_id, title, text}, по строке на документ
   source_to_doc_id.json     # {source_id: doc_id}
   stats.json                # {num_raw, num_dedup, num_truncated, ...}
+  musique_dev_eval.jsonl    # eval-датасет (question, gold_doc_ids)
 ```
 
 **Единица индексации:** параграф. Gold-labels MuSiQue на уровне параграфа — единица индекса должна совпадать.
 
-**Формат записи в индексе (то, что хранится в metadata.jsonl):**
+**Формат записи в корпусе (и в `metadata.jsonl` индекса):**
 ```json
 {
   "doc_id": "musique_p_000001",
@@ -124,11 +127,47 @@ data/processed/
 }
 ```
 
+### Корпус — SBOL FAQ
+
+**Источник:** `data/raw/sbol/faq_index_28_apr.json` — массив FAQ-записей.
+
+**Парсер (`indexing/parse_sbol.py`):** каждая FAQ-запись → один документ; `alternative_questions` → eval-строки.
+
+**Формат документа:**
+```json
+{
+  "doc_id": "sbol_<question_id>",
+  "title": "<question>",
+  "text": "Вопрос:<question>\nРаздел:<sections>\nОтвет:<answer>"
+}
+```
+
+**Формат eval-строки** (одна на каждый `alternative_question`):
+```json
+{
+  "question_id": "sbol_<question_id>_alt_<i>",
+  "question": "<alternative_question>",
+  "gold_doc_ids": ["sbol_<question_id>"]
+}
+```
+
+**Выход парсера:**
+
+```
+data/processed/sbol/
+  corpus.jsonl    # ~7 385 документов
+  eval.jsonl      # ~5 623 eval-строки (только записи с alternative_questions)
+```
+
 ### Embedder
 
-**Модель:** `intfloat/e5-large-v2`
+| Датасет | Модель | Размерность |
+|---------|--------|-------------|
+| MuSiQue | `intfloat/e5-large-v2` | 1024 |
+| SBOL FAQ | `intfloat/multilingual-e5-large` | 1024 |
 
-- Размерность эмбеддингов: 1024
+Обе модели — одна архитектура, одинаковая размерность, одинаковые префиксы. Переключение — только `embedder.name` в конфиге; индекс пересобирается.
+
 - Максимальная длина входа: 512 токенов (passages длиннее обрезаются)
 - L2-нормализация эмбеддингов перед добавлением в индекс (обязательно для cosine через IndexFlatIP)
 
@@ -138,7 +177,7 @@ data/processed/
 
 Префиксы добавляются внутри `embedder.py`, снаружи ни индексатор, ни tool server про них знать не должны. `local_search.query` приходит в tool server как обычный текст.
 
-**Warning на длину.** MuSiQue passages — параграфы Wikipedia, обычно 100–300 токенов, в лимит 512 укладываются с запасом. Но при индексации логируем распределение длин и считаем % truncated passages — если больше 1%, стоит задуматься о sliding-window chunking или смене embedder.
+**Warning на длину.** При индексации логируем распределение длин и считаем % truncated passages — если больше 1%, стоит задуматься о sliding-window chunking или смене embedder.
 
 ### Тип индекса
 
@@ -149,13 +188,18 @@ data/processed/
 ### Персистентность
 
 ```
-index/
-  faiss.index          # бинарный faiss
-  metadata.jsonl       # по строке на doc_id, в порядке векторов в индексе
-  config.json          # embedder name, version, dim, normalization
+indexes/
+  musique/
+    faiss.index        # бинарный faiss
+    metadata.jsonl     # по строке на doc_id, в порядке векторов в индексе
+    config.json        # embedder name, version, dim, normalization
+  sbol/
+    faiss.index
+    metadata.jsonl
+    config.json
 ```
 
-`metadata.jsonl` и `faiss.index` должны оставаться согласованными: i-я строка метаданных соответствует i-му вектору.
+`metadata.jsonl` и `faiss.index` должны оставаться согласованными: i-я строка метаданных соответствует i-му вектору. Конфиг датасета (`configs/<dataset>.yaml`) указывает `index.dir` на нужный подкаталог.
 
 ---
 
@@ -576,10 +620,11 @@ retrieval-agent/
 
   indexing/
     parse_musique.py     # сырые jsonl → corpus.jsonl + source_to_doc_id.json
+    parse_sbol.py        # FAQ json → corpus.jsonl + eval.jsonl
     build_index.py       # corpus.jsonl → faiss.index + metadata.jsonl
     embedder_batch.py    # batched encoding для build_index
 
-  eval/
+  eval_/
     build_eval.py        # сырой dev → eval jsonl с gold_doc_ids
     run_eval.py          # NDCG@10 на dev
     baseline.py          # single-shot RAG
@@ -590,22 +635,32 @@ retrieval-agent/
     checker.py           # TI/TO consistency
 
   configs/
-    default.yaml
+    default.yaml         # MuSiQue (e5-large-v2)
+    sbol.yaml            # SBOL FAQ (multilingual-e5-large)
 
   scripts/
     serve_vllm.sh
-    serve_tool.sh
-    build_all.sh         # parse_musique → build_index → build_eval
-    run_eval.sh
+    serve_tool.sh        # CONFIG= переключает датасет
+    build_all.sh         # parse_musique → build_index → build_eval (MuSiQue)
+    build_sbol.sh        # parse_sbol → build_index (SBOL)
+    run_eval.sh          # CONFIG= + OUT_DIR= переключают датасет
 
   data/
-    raw/musique/         # сырые файлы MuSiQue (не в git)
-    processed/           # corpus.jsonl, source_to_doc_id.json, eval.jsonl
-  index/                 # faiss.index, metadata.jsonl
-  trajectories/          # JSON-логи прогонов (не в git)
+    raw/
+      musique/           # сырые файлы MuSiQue (не в git)
+      sbol/              # faq_index_*.json (не в git)
+    processed/
+      musique/           # corpus.jsonl, source_to_doc_id.json, musique_dev_eval.jsonl, ...
+      sbol/              # corpus.jsonl, eval.jsonl
+
+  indexes/
+    musique/             # faiss.index, metadata.jsonl, config.json
+    sbol/                # faiss.index, metadata.jsonl, config.json
+
+  trajectories_data/     # JSON-логи прогонов (не в git)
 ```
 
-### Конфиг (default.yaml)
+### Конфиг (configs/default.yaml — MuSiQue)
 
 ```yaml
 model:
@@ -613,9 +668,6 @@ model:
   vllm_url: http://localhost:8000/v1
   max_tokens: 4096
   temperature: 0.6
-  enable_thinking: false        # MVP — выключено; ablation после этапа 7 (см. раздел 10)
-  thinking_budget: null         # при enable_thinking=true — мягкое ограничение через
-                                # системный промпт ("Keep your reasoning concise, under N sentences")
 
 tool_server:
   url: http://localhost:8100
@@ -631,7 +683,7 @@ embedder:
   passage_prefix: "passage: "
 
 index:
-  path: ./index/
+  dir: ./indexes/musique/
   top_k_default: 10
   top_k_max: 50
   use_gpu: false              # MVP — CPU; переключить на true при росте корпуса
@@ -644,14 +696,16 @@ agent:
 
 eval:
   raw_musique_dir: ./data/raw/musique/
-  processed_dir: ./data/processed/
-  eval_dataset_path: ./data/processed/musique_dev_eval.jsonl
+  processed_dir: ./data/processed/musique/
+  eval_dataset_path: ./data/processed/musique/musique_dev_eval.jsonl
   subset_size: 200
 
 trajectories:
-  output_dir: ./trajectories/
+  output_dir: ./trajectories_data/
   ti_to_check_every_n: 20
 ```
+
+Для SBOL: `configs/sbol.yaml` — те же поля, `embedder.name: intfloat/multilingual-e5-large`, `index.dir: ./indexes/sbol/`, `eval.eval_dataset_path: ./data/processed/sbol/eval.jsonl`.
 
 ---
 
@@ -677,12 +731,9 @@ trajectories:
 2. **Диалоговое eval:** на MVP не делаем, но стоит заложить хотя бы 10 ручных multi-turn примеров для sanity check того, что harness корректно работает с историей длиннее одного сообщения.
 3. **2WikiMultiHopQA:** изначально в памяти проекта фигурирует union MuSiQue + 2Wiki. На MVP решено начать только с MuSiQue для простоты. Добавление 2Wiki — после того, как будет чистый NDCG на MuSiQue, чтобы не смешивать переменные.
 4. **Точная GPU-конфигурация:** спецификация написана под 4× A100 80GB. При смене железа нужно уточнить `--tensor-parallel-size` и `CUDA_VISIBLE_DEVICES`-раскладку.
-5. **Переход на русскую базу знаний (отложено).** Когда корпус сменится с MuSiQue на русскоязычный:
-    - **Смена embedder:** `intfloat/e5-large-v2` → `intfloat/multilingual-e5-large`. Drop-in замена: та же архитектура, та же размерность 1024, те же префиксы `query: ` / `passage: `. Меняется только `embedder.name` в конфиге; индекс пересобирается.
-    - **Системный промпт остаётся английским.** Qwen3.5 обучен преимущественно на английском tool-calling и instruction-following — структурные форматы (function schemas, теги `<answer>`) надёжнее соблюдаются при английских инструкциях. Модель при этом нормально оперирует русскими данными в tool_results и в свободной генерации.
-    - **Language hint в промпте:** добавить строку вида `"The corpus and user queries are in Russian. Generate local_search queries in Russian to match the corpus language."` Без неё модель иногда генерит запросы по-английски, что с multilingual-e5 работает (он cross-lingual), но даёт чуть худший recall, чем same-language retrieval.
-    - **Few-shot примеры (если появятся):** примеры query — на русском (под язык данных), обвязка/комментарии — на английском.
-    - Это бамп `prompt_version` → v2 в `prompts.py`.
+5. **Русская база знаний (SBOL FAQ) — реализовано.** `configs/sbol.yaml` + `indexing/parse_sbol.py` + `scripts/build_sbol.sh`. Документ индексируется как `"Вопрос:<q>\nРаздел:<s>\nОтвет:<a>"`, embedder — `intfloat/multilingual-e5-large` (drop-in замена: та же архитектура, та же размерность 1024, те же префиксы).
+    - **Системный промпт остаётся английским.** Qwen3.5 обучен преимущественно на английском tool-calling и instruction-following — структурные форматы (function schemas, теги `<answer>`) надёжнее соблюдаются при английских инструкциях. Модель при этом нормально оперирует русскими данными в tool_results.
+    - **Language hint в промпте:** добавить строку вида `"The corpus and user queries are in Russian. Generate local_search queries in Russian to match the corpus language."` Без неё модель иногда генерит запросы по-английски, что с multilingual-e5 работает (он cross-lingual), но даёт чуть худший recall, чем same-language retrieval. Это бамп `prompt_version` → v2 в `prompts.py`.
 6. **Thinking mode (Qwen3 extended reasoning).** На MVP выключен (`enable_thinking: false`) — baseline собирается в non-thinking режиме. Причины:
     - **Латентность множится в multi-turn loop.** При `max_turns=8` каждый turn с thinking даёт +500–2000 reasoning-токенов до видимого вывода → eval из 200 примеров кратно дольше, цикл итерации промпта замедляется.
     - **Thinking + tool calling в OpenAI-compatible API vLLM** — не самая отлаженная комбинация. Reasoning-вывод и `tool_calls` field используют разные структурные маркеры; парсер vLLM при `tool_choice="auto"` иногда некорректно их разделяет, особенно при незакрытых `<think>` блоках. На MVP это лишний источник `parse_error` траекторий, маскирующий реальные проблемы в промпте (https://github.com/vllm-project/vllm/issues/39056).

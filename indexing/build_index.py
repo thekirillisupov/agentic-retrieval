@@ -36,7 +36,7 @@ def load_corpus(path: Path) -> list[DocMeta]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/default.yaml")
-    parser.add_argument("--corpus", default="data/processed/corpus.jsonl")
+    parser.add_argument("--corpus", default="data/processed/musique/corpus.jsonl")
     parser.add_argument("--out-dir", default=None, help="overrides index.dir")
     args = parser.parse_args()
 
@@ -55,6 +55,7 @@ def main() -> None:
         max_length=emb_cfg["max_length"],
         query_prefix=emb_cfg["query_prefix"],
         passage_prefix=emb_cfg["passage_prefix"],
+        pooling=emb_cfg.get("pooling", "mean"),
     )
 
     # Truncation sanity check: the spec calls out >1% truncation as a smell.
