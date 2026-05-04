@@ -13,6 +13,8 @@ indexes/
 trajectories_data/
 *.faiss
 *.index
+outputs/
+wandb/
 
 # Logs
 *.log

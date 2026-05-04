@@ -14,14 +14,27 @@ dependencies = [
     "numpy>=1.26",
     "faiss-cpu>=1.7.4",
     "sentence-transformers>=2.7",
-    "torch>=2.1,<2.6",  # >=2.6 requires CUDA driver newer than 12.3; install via cu121 wheel
-    "transformers>=4.40",
+    "torch==2.8.0",  # >=2.6 requires CUDA driver newer than 12.3; install via cu121 wheel # 2.8.3 later >=2.1,<2.6
+    "torchvision==0.23.0",
+    "torchaudio==2.8.0",
+    "transformers>=4.55,<5.0",  # vLLM 0.11.0 / verl rely on the 4.x tokenizer API (all_special_tokens_extended)
     "openai>=1.30",
     "httpx>=0.27",
     "PyYAML>=6.0",
     "tqdm>=4.66",
     "scikit-learn>=1.4",
+    "verl==0.7.1",
+    "pyarrow>=14",
+    "pandas>=2.1",
+    "vllm==0.11.0", # 0.10.2
+    "xformers==0.0.32.post1",
+    # verl's monkey_patch.py imports `AutoModelForCausalLMWithValueHead` from
+    # trl during FSDP setup. Pin a recent version that still ships this class
+    # so we don't silently fall back to a stale ~/.local install.
+    "trl>=0.9.6,<0.20",
 ]
+# ?? accelerate, flash-attn version
+# downgrade transformers and breaking 
 
 [project.optional-dependencies]
 dev = [
@@ -31,15 +44,6 @@ dev = [
 gpu = [
     # Replace faiss-cpu with faiss-gpu manually if you set index.use_gpu: true.
     # faiss-gpu is not available on PyPI; install via conda or build from source.
-]
-serve = [
-    "vllm>=0.4",
-]
-verl = [
-    # GRPO training stack. veRL pulls in ray, hydra-core, transformers, vllm, etc.
-    "verl>=0.4",
-    "pyarrow>=14",
-    "pandas>=2.1",
 ]
 
 [tool.setuptools.packages.find]

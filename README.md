@@ -75,37 +75,14 @@ End-to-end GRPO over the ReAct loop on MuSiQue train. Reward = NDCG@10 against
 the gold supporting passages, with a one-sided length penalty layered on top.
 
 ```bash
-# 1. Install the verl extras (pulls in ray, hydra, vllm, ...)
 pip install -e .[verl]
-
-# 2. Build the parquet (parses MuSiQue train + writes grpo_{train,val}.parquet)
-bash scripts/build_grpo_data.sh
-
-# 3. Start the tool server (FAISS + E5 embedder)
-bash scripts/serve_tool.sh
-
-# 4. Launch training (8x GPU). The actor's rollout server is internal to veRL —
-#    don't start scripts/serve_vllm.sh for training.
-bash scripts/train_grpo.sh
+SKIP_PARSE=1 bash scripts/build_grpo_data.sh   # writes grpo_{train,val}.parquet
+bash scripts/serve_tool.sh                     # FAISS + E5 (:8100)
+bash scripts/train_grpo.sh                     # veRL spins up its own rollout vLLM
 ```
 
-Knobs called out by the spec:
-
-| Concern | Where |
-|---|---|
-| **Reward = NDCG@k** | `grpo/reward.py` reuses `eval_.metrics.ndcg_at_k`. |
-| **Length normalisation** | `actor.loss_agg_mode=token-mean` + per-token reward penalty (`length_alpha`). |
-| **Group size G** | `actor_rollout_ref.rollout.n=8`. |
-| **Zero-variance filtering** | `algorithm.filter_groups.enable=true, metric=score`. |
-| **TI/TO consistency** | `grpo/ti_to_check.py` re-templates `messages_full` and diffs against `prompt_ids+response_ids`; sampled every `ti_to_check.every_n_steps`. |
-| **Initial model** | `Qwen/Qwen3-14B` at `actor_rollout_ref.model.path`. |
-| **Framework** | veRL (`verl.trainer.main_ppo`) with custom AgentLoop. |
-
-The custom AgentLoop (`grpo/agent_loop.py`, `name=retrieval_react`) drives the
-ReAct rollout: each turn it (a) generates with the in-process rollout server,
-(b) parses Qwen3-XML tool calls, (c) hits the tool server, (d) re-templates the
-new tool messages and extends `response_mask` with 0s so the optimiser only
-takes credit for tokens the actor itself produced.
+Full design + spec→implementation map + open caveats live in
+[`GRPO_README.md`](./GRPO_README.md).
 
 ## Experiments
 

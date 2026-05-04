@@ -34,6 +34,41 @@ from agent.prompts import LOCAL_SEARCH_TOOL_SCHEMA
 log = logging.getLogger(__name__)
 
 
+def _normalize_token_ids(tokenized_output: Any) -> list[int]:
+    """Flatten ``apply_chat_template(tokenize=True)`` output into ``list[int]``.
+
+    Transformers >=4.40 returns a ``BatchEncoding`` of ``Encoding`` objects when
+    ``tools=`` is passed, instead of a plain list of ints. We mirror veRL's
+    ``normalize_token_ids`` so the TI/TO diff stays comparable to what the
+    trainer actually feeds back through the optimiser.
+    """
+    token_ids: Any = tokenized_output
+    if isinstance(tokenized_output, dict) and "input_ids" in tokenized_output:
+        token_ids = tokenized_output["input_ids"]
+    elif hasattr(tokenized_output, "input_ids"):
+        token_ids = tokenized_output.input_ids
+    if hasattr(token_ids, "tolist"):
+        token_ids = token_ids.tolist()
+    if isinstance(token_ids, tuple):
+        token_ids = list(token_ids)
+    if (
+        isinstance(token_ids, list)
+        and len(token_ids) == 1
+        and isinstance(token_ids[0], (list, tuple))
+    ):
+        token_ids = list(token_ids[0])
+    if not isinstance(token_ids, list):
+        raise TypeError(
+            f"token_ids must be list-like, got {type(token_ids).__name__}: {token_ids!r}"
+        )
+    out: list[int] = []
+    for tid in token_ids:
+        if hasattr(tid, "item"):
+            tid = tid.item()
+        out.append(int(tid))
+    return out
+
+
 def check_consistency(
     *,
     tokenizer: Any,
@@ -60,12 +95,13 @@ def check_consistency(
         {k: v for k, v in m.items() if not k.startswith("_")}
         for m in messages_full
     ]
-    rendered: list[int] = tokenizer.apply_chat_template(
+    rendered_raw = tokenizer.apply_chat_template(
         cleaned,
         add_generation_prompt=False,
         tools=tools,
         tokenize=True,
     )
+    rendered: list[int] = _normalize_token_ids(rendered_raw)
     recorded = list(prompt_ids) + list(response_ids)
 
     n = min(len(rendered), len(recorded))

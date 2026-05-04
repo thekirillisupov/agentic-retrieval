@@ -1,5 +1,20 @@
 # GRPO config for the agentic-retrieval ReAct loop on MuSiQue train.
 #
+# We launch via `python -m verl.trainer.main_ppo --config-path <here> --config-name
+# grpo_qwen3_14b`, which would normally bypass `verl/trainer/config/ppo_trainer.yaml`
+# and its entire `defaults:` tree (legacy_reward_impl, dp_actor, dp_critic, reward,
+# rollout_correction, ...).  We restore that base by adding verl's bundled config
+# directory to Hydra's search path and composing `ppo_trainer` first, then layering
+# `_self_` on top.  Same pattern verl uses for its own experimental recipes
+# (e.g. verl/experimental/one_step_off_policy/config/one_step_off_ppo_trainer.yaml).
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
 # Key knobs (called out for the reviewer):
 #   * algorithm.adv_estimator=grpo       — group-relative advantages.
 #   * algorithm.filter_groups.enable=true — drop zero-variance groups before
@@ -19,12 +34,18 @@ data:
   val_files: data/processed/musique/grpo_val.parquet
   prompt_key: prompt
   reward_fn_key: data_source
-  max_prompt_length: 4096
-  max_response_length: 4096
+  max_prompt_length: 16384
+  max_response_length: 16384
   train_batch_size: 64
   val_batch_size: 64
   return_raw_chat: true
   shuffle: true
+  # Forwarded to tokenizer.apply_chat_template (rl_dataset + agent_loop both read
+  # it from `data`, not from `actor_rollout_ref.rollout`).  Disables Qwen3's
+  # <think> blocks during rollout and re-render so prompt_ids/response_ids stay
+  # consistent with what the model actually generated.
+  apply_chat_template_kwargs:
+    enable_thinking: false
 
 algorithm:
   adv_estimator: grpo
@@ -71,15 +92,17 @@ actor_rollout_ref:
     top_p: 0.95
     top_k: -1
     do_sample: true
-    prompt_length: 4096
-    response_length: 4096
-    gpu_memory_utilization: 0.80
+    prompt_length: 16384
+    response_length: 16384
+    gpu_memory_utilization: 0.60
+    max_num_seqs: 32
     tensor_model_parallel_size: 2
     enforce_eager: false
     free_cache_engine: true
     max_model_len: 16384
-    chat_template_kwargs:
-      enable_thinking: false
+    # Forward-pass batch size when the rollout worker re-computes log-probs for
+    # the importance ratio (separate from training).  Matches `ref` for parity.
+    log_prob_micro_batch_size_per_gpu: 2
     # AgentLoop registry — point veRL at our subclass.
     agent:
       agent_loop_config_path: configs/agent_loop_registry.yaml
@@ -96,13 +119,17 @@ actor_rollout_ref:
       param_offload: true
     log_prob_micro_batch_size_per_gpu: 2
 
+# Custom reward function.  The base `legacy_reward_impl.yaml` declares this
+# section with null values; our overrides here are picked up by
+# verl.experimental.reward_loop.migrate_legacy_reward_impl, which copies
+# the whole block into `config.reward.custom_reward_function` post-load.
 custom_reward_function:
   path: grpo/reward.py
   name: compute_score
   reward_kwargs:
     ndcg_k: 10
     length_alpha: 0.05
-    length_target_tokens: 2048
+    length_target_tokens: 4096
     parse_error_penalty: 0.0
 
 # Agent-loop runtime parameters. Read by RetrievalReActAgentLoop.init_class.
@@ -122,7 +149,7 @@ trainer:
   total_epochs: 1
   total_training_steps: null          # cap by epochs; set this to override
   nnodes: 1
-  n_gpus_per_node: 8
+  n_gpus_per_node: 4                  # box has 4× A100-80GB (was 8)
   save_freq: 100
   test_freq: 50
   logger: ['console', 'wandb']
