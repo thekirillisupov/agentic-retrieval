@@ -1,0 +1,192 @@
+# GSPO config for the agentic-retrieval ReAct loop on MuSiQue, with the
+# Qwen3.5-35B-A3B MoE actor.
+#
+# GSPO (Group Sequence Policy Optimization, Qwen team) keeps GRPO's
+# group-relative advantages but swaps the PPO token-level importance ratio for a
+# sequence-level ratio. That stabilises training of MoE policies where the
+# top-k routing decisions make per-token ratios extremely noisy.
+#
+# Wiring vs. the official recipe (verl examples/gspo_trainer/run_qwen3_30b_a3b_megatron.sh):
+#   * actor_rollout_ref.actor.policy_loss.loss_mode=gspo  — selects compute_policy_loss_gspo
+#                                                           (verl/trainer/ppo/core_algos.py).
+#   * actor.loss_agg_mode=seq-mean-token-mean             — GSPO aggregation.
+#   * actor.clip_ratio_low/high=3e-4 / 4e-4               — sequence-level ratios are
+#                                                           tight; do NOT reuse GRPO's 0.2.
+#   * actor.clip_ratio_c=10.0                             — dual-clip safety guard.
+#   * algorithm.adv_estimator=grpo                        — GSPO is a policy-loss swap
+#                                                           on top of GRPO advantages.
+#   * model_engine=megatron + Megatron EP/TP              — MoE expert parallelism.
+#
+# Launch:
+#   python -m verl.trainer.main_ppo --config-path configs --config-name gspo_qwen3_moe
+# (see scripts/train_gspo.sh).
+
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+# Top-level engine selector — verl reads this to dispatch the actor/ref workers
+# to Megatron instead of FSDP.
+model_engine: megatron
+
+data:
+  train_files: data/processed/musique/grpo_train.parquet
+  val_files: data/processed/musique/grpo_val.parquet
+  prompt_key: prompt
+  reward_fn_key: data_source
+  max_prompt_length: 16384
+  max_response_length: 16384
+  train_batch_size: 128
+  val_batch_size: 128
+  return_raw_chat: true
+  shuffle: true
+  filter_overlong_prompts: true
+  truncation: error
+  apply_chat_template_kwargs:
+    enable_thinking: false
+
+algorithm:
+  adv_estimator: grpo                  # group-relative advantages (GSPO keeps these)
+  norm_adv_by_std_in_grpo: true
+  use_kl_in_reward: false
+  gamma: 1.0
+  lam: 1.0
+  filter_groups:
+    enable: true
+    metric: score
+    max_num_gen_batches: 4
+
+actor_rollout_ref:
+  hybrid_engine: true
+  model:
+    path: Qwen/Qwen3.5-35B-A3B
+    use_remove_padding: true
+    enable_gradient_checkpointing: true
+    trust_remote_code: true
+
+  actor:
+    # GSPO knobs
+    policy_loss:
+      loss_mode: gspo
+    loss_agg_mode: seq-mean-token-mean
+    clip_ratio_low: 3.0e-4
+    clip_ratio_high: 4.0e-4
+    clip_ratio_c: 10.0
+
+    optim:
+      lr: 1.0e-6                       # full fine-tune LR (recipe default)
+      weight_decay: 0.0
+      warmup_style: cosine
+      lr_warmup_steps_ratio: 0.03
+      min_lr_ratio: 0.1
+    ppo_mini_batch_size: 32            # 4 grad updates / batch (128 / 32)
+    use_dynamic_bsz: true
+    ppo_max_token_len_per_gpu: 30720   # dynamic batching budget per GPU
+    use_kl_loss: false                 # GSPO recipe drops the KL anchor
+    entropy_coeff: 0.0
+
+    megatron:
+      tensor_model_parallel_size: 2
+      pipeline_model_parallel_size: 1
+      expert_model_parallel_size: 8    # 8-way EP across all GPUs
+      expert_tensor_parallel_size: 1
+      param_offload: true
+      grad_offload: true
+      optimizer_offload: true
+      use_mbridge: true
+      override_transformer_config:
+        moe_router_dtype: fp32
+        moe_permute_fusion: true
+        recompute_method: uniform
+        recompute_granularity: full
+        recompute_num_layers: 1
+        apply_rope_fusion: true
+
+  rollout:
+    name: vllm
+    mode: async                        # AgentLoop requires async rollout
+    n: 8                               # G — group size
+    temperature: 1.0
+    top_p: 0.8
+    top_k: -1
+    do_sample: true
+    prompt_length: 16384
+    response_length: 8192
+    gpu_memory_utilization: 0.65
+    max_num_seqs: 16
+    tensor_model_parallel_size: 4      # vLLM TP for the 35B-A3B MoE
+    enforce_eager: false
+    free_cache_engine: true
+    max_model_len: 24576
+    log_prob_use_dynamic_bsz: true
+    log_prob_max_token_len_per_gpu: 30720
+    checkpoint_engine:
+      update_weights_bucket_megabytes: 4096
+    agent:
+      agent_loop_config_path: configs/agent_loop_registry.yaml
+      num_workers: 128
+    multi_turn:
+      enable: true
+      max_assistant_turns: 8
+      max_user_turns: 0
+      tool_response_truncate_side: right
+      max_tool_response_length: 4096
+    val_kwargs:
+      n: 1
+      temperature: 1.0
+      top_p: 0.7
+
+  ref:
+    log_prob_use_dynamic_bsz: true
+    log_prob_max_token_len_per_gpu: 30720
+    megatron:
+      tensor_model_parallel_size: 2
+      pipeline_model_parallel_size: 1
+      expert_model_parallel_size: 8
+      expert_tensor_parallel_size: 1
+      param_offload: true
+      use_mbridge: true
+
+reward:
+  custom_reward_function:
+    path: grpo/reward.py
+    name: compute_score
+    reward_kwargs:
+      ndcg_k: 10
+      length_alpha: 0.05
+      length_target_tokens: 4096
+      parse_error_penalty: 0.0
+
+agent_loop:
+  retrieval_react:
+    tool_server_url: http://localhost:8100
+    tool_timeout_s: 30
+    max_turns: 8
+    max_tool_calls: 10
+    top_k_default: 10
+    top_k_max: 50
+    max_response_tokens: 4096
+
+trainer:
+  project_name: agentic_retrieval_gspo
+  experiment_name: qwen3_moe_a3b_musique
+  total_epochs: 1
+  total_training_steps: null
+  nnodes: 1
+  n_gpus_per_node: 8
+  save_freq: 50
+  max_actor_ckpt_to_keep: null
+  test_freq: 5
+  logger: ['console', 'wandb']
+  default_local_dir: checkpoints/gspo_qwen3_moe/
+  val_before_train: true
+  balance_batch: true
+  critic_warmup: 0
+
+ti_to_check:
+  every_n_steps: 50
+  num_samples: 4
