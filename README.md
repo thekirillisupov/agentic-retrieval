@@ -17,10 +17,11 @@ See the technical specification for the full architectural rationale.
 agent/           ReAct loop, prompts, schemas, parser
 tool_server/     FastAPI app: /local_search, /healthz, /stats
 indexing/        corpus parsers (MuSiQue, SBOL) + faiss index builder
-eval_/           NDCG@k, Recall@k; single-shot baseline; agent eval
+eval_/           NDCG@k, Recall@k; single-shot baseline; agent eval; train-set builder
 trajectories/    JSON trace writer + TI/TO consistency check
-configs/         per-dataset configs (default.yaml = MuSiQue, sbol.yaml = SBOL FAQ)
-scripts/         shell wrappers for vLLM, tool server, build, eval
+grpo/            GRPO training: data_prep, AgentLoop, reward, TI/TO check
+configs/         per-dataset configs (default.yaml, sbol.yaml) + grpo_qwen3_14b.yaml
+scripts/         shell wrappers for vLLM, tool server, build, eval, GRPO training
 indexes/         FAISS indexes per dataset (musique/, sbol/)
 data/processed/  processed corpora and eval sets per dataset (musique/, sbol/)
 ```
@@ -67,6 +68,21 @@ and the shell scripts expose a `CONFIG=` env var to switch datasets.
 Every rollout writes a JSON file under `trajectories_data/` with the full message
 history, tool calls, and token counts. Format is designed to drop straight into
 veRL/Search-R1-style RL pipelines later — see `trajectories/writer.py`.
+
+## GRPO training
+
+End-to-end GRPO over the ReAct loop on MuSiQue train. Reward = NDCG@10 against
+the gold supporting passages, with a one-sided length penalty layered on top.
+
+```bash
+pip install -e .[verl]
+SKIP_PARSE=1 bash scripts/build_grpo_data.sh   # writes grpo_{train,val}.parquet
+bash scripts/serve_tool.sh                     # FAISS + E5 (:8100)
+bash scripts/train_grpo.sh                     # veRL spins up its own rollout vLLM
+```
+
+Full design + spec→implementation map + open caveats live in
+[`GRPO_README.md`](./GRPO_README.md).
 
 ## Experiments
 

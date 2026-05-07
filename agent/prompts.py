@@ -14,7 +14,7 @@ PROMPT_V1 = """You are a retrieval agent. Given a conversation, find \
     using the full conversation as context.
 
 You have one tool:
-- local_search(query: str, top_k: int = 10) — returns a list of documents with \
+- local_search(query: str, top_k: int = 8) — returns a list of documents with \
 doc_id, title, text, and relevance score.
 
 You may call local_search multiple times with different queries as needed. When you \
@@ -30,7 +30,7 @@ PROMPT_V1_ru = """You are a retrieval agent. Given a conversation, find \
     using the full conversation as context.
 
 You have one tool:
-- local_search(query: str, top_k: int = 10) — returns a list of documents with \
+- local_search(query: str, top_k: int = 8) — returns a list of documents with \
 doc_id, title, text, and relevance score.
 
 You may call local_search multiple times with different queries as needed. When you \

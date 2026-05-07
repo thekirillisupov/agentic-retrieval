@@ -1,0 +1,172 @@
+# GRPO config for the agentic-retrieval ReAct loop on MuSiQue train.
+#
+# We launch via `python -m verl.trainer.main_ppo --config-path <here> --config-name
+# grpo_qwen3_14b`, which would normally bypass `verl/trainer/config/ppo_trainer.yaml`
+# and its entire `defaults:` tree (legacy_reward_impl, dp_actor, dp_critic, reward,
+# rollout_correction, ...).  We restore that base by adding verl's bundled config
+# directory to Hydra's search path and composing `ppo_trainer` first, then layering
+# `_self_` on top.  Same pattern verl uses for its own experimental recipes
+# (e.g. verl/experimental/one_step_off_policy/config/one_step_off_ppo_trainer.yaml).
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+# Key knobs (called out for the reviewer):
+#   * algorithm.adv_estimator=grpo       — group-relative advantages.
+#   * algorithm.filter_groups.enable=true — drop zero-variance groups before
+#                                           the policy update (otherwise we
+#                                           waste a step on a flat reward).
+#   * actor_rollout_ref.rollout.n=8       — group size G.
+#   * actor.loss_agg_mode=token-mean      — length normalisation inside the
+#                                           policy gradient (per-token mean).
+#   * actor.use_kl_loss + low coef        — KL anchor against the frozen ref.
+#
+# Custom pieces:
+#   * agent_loop=retrieval_react          — defined in grpo/agent_loop.py.
+#   * custom_reward_function=grpo.reward  — NDCG@k + length-norm penalty.
+
+data:
+  train_files: data/processed/musique/grpo_train.parquet
+  # grpo_val_256.parquet  — 256 questions sampled from the real MuSiQue dev set (fast, used by default)
+  # grpo_val_full.parquet — all 2161 questions from the real MuSiQue dev set (use for final / thorough eval)
+  val_files: data/processed/musique/grpo_val.parquet
+  prompt_key: prompt
+  reward_fn_key: data_source
+  max_prompt_length: 16384
+  max_response_length: 16384
+  train_batch_size: 128
+  val_batch_size: 128
+  return_raw_chat: true
+  shuffle: true
+  # Forwarded to tokenizer.apply_chat_template (rl_dataset + agent_loop both read
+  # it from `data`, not from `actor_rollout_ref.rollout`).  Disables Qwen3's
+  # <think> blocks during rollout and re-render so prompt_ids/response_ids stay
+  # consistent with what the model actually generated.
+  apply_chat_template_kwargs:
+    enable_thinking: false
+
+algorithm:
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: true       # standard GRPO normalisation
+  use_kl_in_reward: false             # KL handled in actor loss instead
+  gamma: 1.0
+  lam: 1.0
+  filter_groups:
+    enable: true
+    metric: score                     # filter on the scalar reward
+    max_num_gen_batches: 4            # try up to 4× rollouts to fill the batch
+
+actor_rollout_ref:
+  hybrid_engine: true
+  model:
+    path: Qwen/Qwen3-14B
+    use_remove_padding: true
+    enable_gradient_checkpointing: true
+    trust_remote_code: true
+    lora_rank: 16
+    lora_alpha: 32
+    target_modules: all-linear
+
+  actor:
+    optim:
+      lr: 1.0e-4 # 5.0e-6 without lora
+      weight_decay: 0.0
+      warmup_style: cosine
+      lr_warmup_steps_ratio: 0.03
+      min_lr_ratio: 0.1 
+    ppo_mini_batch_size: 64 # in order to get 2-4 gradient updates on one batch size's rollouts = train_batch_size / ppo_mini_batch_size
+    ppo_micro_batch_size_per_gpu: 8 # forward+backward on one GPU for one gradient update CAN BE CHANGED in order fit into memory
+    use_kl_loss: true
+    kl_loss_coef: 0.001
+    kl_loss_type: low_var_kl
+    entropy_coeff: 0.0
+    clip_ratio: 0.2
+    loss_agg_mode: token-mean         # length normalisation
+    fsdp_config:
+      fsdp_size: -1
+      param_offload: false
+      optimizer_offload: false
+
+  rollout:
+    name: vllm
+    mode: async                       # AgentLoop requires async rollout
+    load_format: safetensors        # for lora
+    layered_summon: true
+    n: 8                              # G — group size for GRPO
+    temperature: 1.0
+    top_p: 0.8
+    top_k: -1
+    do_sample: true
+    prompt_length: 16384
+    response_length: 8192
+    gpu_memory_utilization: 0.50
+    checkpoint_engine:
+      update_weights_bucket_megabytes: 4096
+    max_num_seqs: 16  # vllm batch size CAN BE CHANGED
+    tensor_model_parallel_size: 2
+    enforce_eager: false
+    free_cache_engine: true
+    max_model_len: 24576
+    # Forward-pass batch size when the rollout worker re-computes log-probs for
+    # the importance ratio (separate from training).  Matches `ref` for parity.
+    log_prob_micro_batch_size_per_gpu: 16 # CAN BE CHANGED
+    # AgentLoop registry — point veRL at our subclass.
+    agent:
+      agent_loop_config_path: configs/agent_loop_registry.yaml
+      num_workers: 128
+    multi_turn:
+      enable: true
+      max_assistant_turns: 8
+      max_user_turns: 0               # ReAct: only assistant + tool turns
+      tool_response_truncate_side: right
+      max_tool_response_length: 4096
+
+  ref:
+    fsdp_config:
+      param_offload: true
+    log_prob_micro_batch_size_per_gpu: 16 # CAN BE CHANGED
+
+reward:
+  custom_reward_function:
+    path: grpo/reward.py
+    name: compute_score
+    reward_kwargs:
+      ndcg_k: 10
+      length_alpha: 0.05
+      length_target_tokens: 4096
+      parse_error_penalty: 0.0
+
+# Agent-loop runtime parameters. Read by RetrievalReActAgentLoop.init_class.
+agent_loop:
+  retrieval_react:
+    tool_server_url: http://localhost:8100
+    tool_timeout_s: 30
+    max_turns: 8
+    max_tool_calls: 10
+    top_k_default: 10
+    top_k_max: 50
+    max_response_tokens: 4096
+
+trainer:
+  project_name: agentic_retrieval_grpo
+  experiment_name: qwen3_14b_musique
+  total_epochs: 1
+  total_training_steps: null          
+  nnodes: 1
+  n_gpus_per_node: 8                  
+  save_freq: 50
+  max_actor_ckpt_to_keep: null
+  test_freq: 5
+  logger: ['console', 'wandb']
+  default_local_dir: checkpoints/grpo_qwen3_14b/
+  val_before_train: true
+
+# TI/TO check cadence: trainer hook samples this many trajectories every N steps
+# and verifies the chat-template re-render matches prompt_ids+response_ids.
+ti_to_check:
+  every_n_steps: 50
+  num_samples: 4
