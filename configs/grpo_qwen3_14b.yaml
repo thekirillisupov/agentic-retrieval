@@ -31,13 +31,15 @@ defaults:
 
 data:
   train_files: data/processed/musique/grpo_train.parquet
+  # grpo_val_256.parquet  — 256 questions sampled from the real MuSiQue dev set (fast, used by default)
+  # grpo_val_full.parquet — all 2161 questions from the real MuSiQue dev set (use for final / thorough eval)
   val_files: data/processed/musique/grpo_val.parquet
   prompt_key: prompt
   reward_fn_key: data_source
   max_prompt_length: 16384
   max_response_length: 16384
-  train_batch_size: 64
-  val_batch_size: 64
+  train_batch_size: 128
+  val_batch_size: 128
   return_raw_chat: true
   shuffle: true
   # Forwarded to tokenizer.apply_chat_template (rl_dataset + agent_loop both read
@@ -65,14 +67,19 @@ actor_rollout_ref:
     use_remove_padding: true
     enable_gradient_checkpointing: true
     trust_remote_code: true
+    lora_rank: 16
+    lora_alpha: 32
+    target_modules: all-linear
 
   actor:
     optim:
-      lr: 1.0e-6
+      lr: 1.0e-4 # 5.0e-6 without lora
       weight_decay: 0.0
+      warmup_style: cosine
       lr_warmup_steps_ratio: 0.03
-    ppo_mini_batch_size: 32
-    ppo_micro_batch_size_per_gpu: 1
+      min_lr_ratio: 0.1 
+    ppo_mini_batch_size: 64 # in order to get 2-4 gradient updates on one batch size's rollouts = train_batch_size / ppo_mini_batch_size
+    ppo_micro_batch_size_per_gpu: 8 # forward+backward on one GPU for one gradient update CAN BE CHANGED in order fit into memory
     use_kl_loss: true
     kl_loss_coef: 0.001
     kl_loss_type: low_var_kl
@@ -87,26 +94,30 @@ actor_rollout_ref:
   rollout:
     name: vllm
     mode: async                       # AgentLoop requires async rollout
+    load_format: safetensors        # for lora
+    layered_summon: true
     n: 8                              # G — group size for GRPO
     temperature: 1.0
-    top_p: 0.95
+    top_p: 0.8
     top_k: -1
     do_sample: true
     prompt_length: 16384
-    response_length: 16384
-    gpu_memory_utilization: 0.60
-    max_num_seqs: 32
+    response_length: 8192
+    gpu_memory_utilization: 0.50
+    checkpoint_engine:
+      update_weights_bucket_megabytes: 4096
+    max_num_seqs: 16  # vllm batch size CAN BE CHANGED
     tensor_model_parallel_size: 2
     enforce_eager: false
     free_cache_engine: true
-    max_model_len: 16384
+    max_model_len: 24576
     # Forward-pass batch size when the rollout worker re-computes log-probs for
     # the importance ratio (separate from training).  Matches `ref` for parity.
-    log_prob_micro_batch_size_per_gpu: 2
+    log_prob_micro_batch_size_per_gpu: 16 # CAN BE CHANGED
     # AgentLoop registry — point veRL at our subclass.
     agent:
       agent_loop_config_path: configs/agent_loop_registry.yaml
-      num_workers: 8
+      num_workers: 128
     multi_turn:
       enable: true
       max_assistant_turns: 8
@@ -117,20 +128,17 @@ actor_rollout_ref:
   ref:
     fsdp_config:
       param_offload: true
-    log_prob_micro_batch_size_per_gpu: 2
+    log_prob_micro_batch_size_per_gpu: 16 # CAN BE CHANGED
 
-# Custom reward function.  The base `legacy_reward_impl.yaml` declares this
-# section with null values; our overrides here are picked up by
-# verl.experimental.reward_loop.migrate_legacy_reward_impl, which copies
-# the whole block into `config.reward.custom_reward_function` post-load.
-custom_reward_function:
-  path: grpo/reward.py
-  name: compute_score
-  reward_kwargs:
-    ndcg_k: 10
-    length_alpha: 0.05
-    length_target_tokens: 4096
-    parse_error_penalty: 0.0
+reward:
+  custom_reward_function:
+    path: grpo/reward.py
+    name: compute_score
+    reward_kwargs:
+      ndcg_k: 10
+      length_alpha: 0.05
+      length_target_tokens: 4096
+      parse_error_penalty: 0.0
 
 # Agent-loop runtime parameters. Read by RetrievalReActAgentLoop.init_class.
 agent_loop:
@@ -147,11 +155,12 @@ trainer:
   project_name: agentic_retrieval_grpo
   experiment_name: qwen3_14b_musique
   total_epochs: 1
-  total_training_steps: null          # cap by epochs; set this to override
+  total_training_steps: null          
   nnodes: 1
-  n_gpus_per_node: 4                  # box has 4× A100-80GB (was 8)
-  save_freq: 100
-  test_freq: 50
+  n_gpus_per_node: 8                  
+  save_freq: 50
+  max_actor_ckpt_to_keep: null
+  test_freq: 5
   logger: ['console', 'wandb']
   default_local_dir: checkpoints/grpo_qwen3_14b/
   val_before_train: true

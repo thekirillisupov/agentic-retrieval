@@ -13,8 +13,8 @@
 set -euo pipefail
 
 CONFIG="${CONFIG:-configs/grpo_qwen3_14b.yaml}"
-GPUS="${GPUS:-0,1,2,3}"
-N_GPUS="${N_GPUS:-4}"
+GPUS="${GPUS:-0,1,2,3,4,5,6,7}"
+N_GPUS="${N_GPUS:-8}"
 NNODES="${NNODES:-1}"
 
 # We pass the YAML config directly. veRL accepts both Hydra-style overrides and
