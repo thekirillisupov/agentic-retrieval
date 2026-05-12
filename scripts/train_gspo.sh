@@ -29,6 +29,11 @@ EXTRA_OVERRIDES=("$@")
 # Required by Megatron + NCCL for deterministic comm scheduling.
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export VLLM_USE_V1=1
+# NOTE: expandable_segments:True is intentionally NOT set here.
+# vLLM's CuMemAllocator (used by free_cache_engine / --enable_sleep_mode)
+# hard-asserts that expandable segments are disabled — the two allocator
+# strategies are mutually exclusive. OOM on the Adam step is mitigated by
+# the actor's param_offload + grad_offload + optimizer_offload settings.
 
 CUDA_VISIBLE_DEVICES="${GPUS}" \
 PYTHONPATH=".:${PYTHONPATH:-}" \

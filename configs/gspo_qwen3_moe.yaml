@@ -15,7 +15,7 @@
 #   * actor.clip_ratio_c=10.0                             — dual-clip safety guard.
 #   * algorithm.adv_estimator=grpo                        — GSPO is a policy-loss swap
 #                                                           on top of GRPO advantages.
-#   * model_engine=megatron + Megatron EP/TP              — MoE expert parallelism.
+#   * defaults: ppo_megatron_trainer                       — selects McoreActorConfig + Megatron EP/TP.
 #
 # Launch:
 #   python -m verl.trainer.main_ppo --config-path configs --config-name gspo_qwen3_moe
@@ -26,25 +26,18 @@ hydra:
     - pkg://verl.trainer.config
 
 defaults:
-  - ppo_trainer
+  - ppo_megatron_trainer
   - _self_
-
-# Top-level engine selector — verl reads this to dispatch the actor/ref workers
-# to Megatron instead of FSDP.
-model_engine: megatron
 
 data:
   train_files: data/processed/musique/grpo_train.parquet
   val_files: data/processed/musique/grpo_val.parquet
   prompt_key: prompt
   reward_fn_key: data_source
-  max_prompt_length: 16384
-  max_response_length: 16384
   train_batch_size: 128
   val_batch_size: 128
   return_raw_chat: true
   shuffle: true
-  filter_overlong_prompts: true
   truncation: error
   apply_chat_template_kwargs:
     enable_thinking: false
@@ -63,10 +56,19 @@ algorithm:
 actor_rollout_ref:
   hybrid_engine: true
   model:
+    # model_merger.sh writes HF under this dir; Megatron dist is under <this>/dist_ckpt/ (see scripts/model_merger.py).
+    # HF load: use_dist_checkpointing: false + vanilla_mbridge (current actor/ref below).
+    # MCore dist load: use_dist_checkpointing: true, dist_checkpointing_path: checkpoints/qwen3_5_35b_TP2_EP8_PP1/dist_ckpt, keep model.path here for tokenizer/config.
     path: Qwen/Qwen3.5-35B-A3B
-    use_remove_padding: true
+    use_remove_padding: false  # GatedDeltaNet (SSM layers in Qwen3.5-MoE) does not support packed sequences
     enable_gradient_checkpointing: true
     trust_remote_code: true
+    # WARNING ... Recommend to disable use_fused_kernels since the fused kernel's performance is broken for triton>=3.3
+    # Unless you are using a very old version of triton < 3.3
+    # use_fused_kernels: true                # NEW: fused log_prob + entropy, avoids the .clone()
+    # fused_kernel_options:
+    #   impl_backend: torch                  # safe default; switch to "triton" only if your triton<3.3
+
 
   actor:
     # GSPO knobs
@@ -80,31 +82,52 @@ actor_rollout_ref:
     optim:
       lr: 1.0e-6                       # full fine-tune LR (recipe default)
       weight_decay: 0.0
-      warmup_style: cosine
+      lr_decay_style: cosine           # Megatron uses lr_decay_style (not warmup_style)
       lr_warmup_steps_ratio: 0.03
-      min_lr_ratio: 0.1
+      min_lr: 1.0e-7                   # 10% of peak LR (Megatron expects absolute min_lr)
+      clip_grad: 1.0
+      override_optimizer_config:
+        optimizer_offload_fraction: 1
+        overlap_cpu_optimizer_d2h_h2d: true
+        use_precision_aware_optimizer: true
+        optimizer_cpu_offload: true
     ppo_mini_batch_size: 32            # 4 grad updates / batch (128 / 32)
-    use_dynamic_bsz: true
-    ppo_max_token_len_per_gpu: 30720   # dynamic batching budget per GPU
+    use_dynamic_bsz: false
+    ppo_micro_batch_size_per_gpu: 1
+    # ppo_max_token_len_per_gpu: 20480    # using for dynamic batching
     use_kl_loss: false                 # GSPO recipe drops the KL anchor
     entropy_coeff: 0.0
 
     megatron:
+      # WARNING: Qwen3.5/Qwen3-Next has num_key_value_heads=2 with attention_output_gate=True.
+      # Megatron's get_query_key_value_tensors slices `query` down when
+      # num_query_groups < tp_size but does NOT apply the same slice to `gate`,
+      # so `_apply_output_gate` crashes with `gate.view(*x.shape)` (gate is
+      # tp_size/num_kv_heads× larger than x). Keep TP <= num_kv_heads (=2).
       tensor_model_parallel_size: 2
       pipeline_model_parallel_size: 1
-      expert_model_parallel_size: 8    # 8-way EP across all GPUs
+      expert_model_parallel_size: 8    
       expert_tensor_parallel_size: 1
       param_offload: true
       grad_offload: true
+      # Required whenever use_dist_checkpointing is true (verl does not infer this from model.path).
+      # Default merger layout: scripts/model_merger.py writes MCore dist under <model.path>/dist_ckpt/
+      dist_checkpointing_path: checkpoints/qwen3_5_35b_TP2_EP8_PP1/dist_ckpt
+      use_dist_checkpointing: true
+      dist_ckpt_optim_fully_reshardable: false
       optimizer_offload: true
       use_mbridge: true
+      vanilla_mbridge: true
+      use_remove_padding: false        # GatedDeltaNet (SSM) does not support packed sequences;
+      dtype: bfloat16
       override_transformer_config:
-        moe_router_dtype: fp32
-        moe_permute_fusion: true
+        # moe_router_dtype: fp32
+        # moe_permute_fusion: true
         recompute_method: uniform
+        attention_backend: auto
         recompute_granularity: full
         recompute_num_layers: 1
-        apply_rope_fusion: true
+        apply_rope_fusion: false   # mbridge/qwen3_5 absolute-RoPE asserts apply_rope_fusion is False
 
   rollout:
     name: vllm
@@ -114,16 +137,18 @@ actor_rollout_ref:
     top_p: 0.8
     top_k: -1
     do_sample: true
-    prompt_length: 16384
-    response_length: 8192
-    gpu_memory_utilization: 0.65
-    max_num_seqs: 16
-    tensor_model_parallel_size: 4      # vLLM TP for the 35B-A3B MoE
+    prompt_length: 2048   #  covers only the initial prompt_ids
+    response_length: 8192  # the response window. It contains all turns accumulated during the loop: assistant-generated tokens (mask=1) + tool-result tokens appended with mask=0
+    gpu_memory_utilization: 0.50   # raised from 0.40: 35B-A3B TP=2 shard is ~35 GB → needs >43% budget just for weights
+    max_num_seqs: 8                # reduced from 16 to keep KV cache footprint small at the higher utilisation
+    tensor_model_parallel_size: 2      # vLLM TP
     enforce_eager: false
     free_cache_engine: true
-    max_model_len: 24576
-    log_prob_use_dynamic_bsz: true
-    log_prob_max_token_len_per_gpu: 30720
+    max_model_len: 10240
+    dtype: bfloat16
+    # log_prob_use_dynamic_bsz: false
+    log_prob_micro_batch_size_per_gpu: 1
+    # log_prob_max_token_len_per_gpu: 20480   # match actor budget to keep entropy logits in memory
     checkpoint_engine:
       update_weights_bucket_megabytes: 4096
     agent:
@@ -131,19 +156,21 @@ actor_rollout_ref:
       num_workers: 128
     multi_turn:
       enable: true
-      max_assistant_turns: 8
+      max_assistant_turns: 4
       max_user_turns: 0
       tool_response_truncate_side: right
-      max_tool_response_length: 4096
+      max_tool_response_length: 2048
     val_kwargs:
       n: 1
       temperature: 1.0
       top_p: 0.7
 
   ref:
-    log_prob_use_dynamic_bsz: true
-    log_prob_max_token_len_per_gpu: 30720
+    log_prob_use_dynamic_bsz: false
+    log_prob_micro_batch_size_per_gpu: 1
+    # log_prob_max_token_len_per_gpu: 20480   # ref also needs the smaller budget
     megatron:
+      # See note in actor.megatron above: TP must be <= num_key_value_heads (=2).
       tensor_model_parallel_size: 2
       pipeline_model_parallel_size: 1
       expert_model_parallel_size: 8
@@ -169,7 +196,7 @@ agent_loop:
     max_tool_calls: 10
     top_k_default: 10
     top_k_max: 50
-    max_response_tokens: 4096
+    max_response_tokens: 2048
 
 trainer:
   project_name: agentic_retrieval_gspo
@@ -178,12 +205,12 @@ trainer:
   total_training_steps: null
   nnodes: 1
   n_gpus_per_node: 8
-  save_freq: 50
+  save_freq: 5
   max_actor_ckpt_to_keep: null
-  test_freq: 5
+  test_freq: 1
   logger: ['console', 'wandb']
   default_local_dir: checkpoints/gspo_qwen3_moe/
-  val_before_train: true
+  val_before_train: false
   balance_batch: true
   critic_warmup: 0
 
