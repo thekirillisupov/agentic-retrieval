@@ -39,6 +39,18 @@ def simple_f1(precision: float, recall: float) -> float:
     return 2 * precision * recall / (precision + recall)
 
 
+def f_beta(precision: float, recall: float, beta: float) -> float:
+    """F_beta score: (1+beta^2) * P * R / (beta^2 * P + R).
+
+    beta>1 weights recall more (e.g. beta=2), beta<1 weights precision more.
+    """
+    b2 = beta * beta
+    denom = b2 * precision + recall
+    if denom == 0.0:
+        return 0.0
+    return (1.0 + b2) * precision * recall / denom
+
+
 def dcg_at_k(predicted: list[str], gold: set[str], k: int) -> float:
     dcg = 0.0
     for i, doc_id in enumerate(predicted[:k], start=1):

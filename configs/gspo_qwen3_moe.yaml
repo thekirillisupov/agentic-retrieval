@@ -183,8 +183,11 @@ reward:
     path: grpo/reward.py
     name: compute_score
     reward_kwargs:
+      # r = alpha * NDCG@k + (1 - alpha) * F_beta(output)  -  length_penalty
       ndcg_k: 10
-      length_alpha: 0.05
+      alpha: 0.7
+      f_beta: 2.0
+      length_alpha: 0.0              # length penalty is OPTIONAL; set >0 to enable
       length_target_tokens: 4096
       parse_error_penalty: 0.0
 
