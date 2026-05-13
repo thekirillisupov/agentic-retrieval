@@ -60,19 +60,18 @@ echo "========================================"
 conda install -n "${ENV_NAME}" -c nvidia nccl -y || \
   conda install -n "${ENV_NAME}" -c conda-forge nccl -y
 
-# Step 8: TransformerEngine v2.12 — OPTIONAL (FP8 training only, not needed for vllm inference)
-# Uncomment below if you need FP8 training with Megatron-LM / verl:
-#
-# SP="${ENV_PATH}/lib/python3.12/site-packages"
-# conda run -n "${ENV_NAME}" bash -c "
-#   export NVTE_FRAMEWORK=pytorch
-#   export CPATH=\"${ENV_PATH}/include:${SP}/nvidia/nvtx/include:${SP}/nvidia/nccl/include:${SP}/nvidia/cudnn/include:${SP}/nvidia/cuda_runtime/include:${SP}/nvidia/cuda_nvrtc/include:\${CPATH:-}\"
-#   export LIBRARY_PATH=\"${ENV_PATH}/lib:${SP}/nvidia/nccl/lib:${SP}/nvidia/cudnn/lib:\${LIBRARY_PATH:-}\"
-#   MAX_JOBS=16 NVTE_BUILD_THREADS_PER_JOB=4 \
-#   pip3 install --resume-retries 999 --no-build-isolation \
-#     git+https://github.com/NVIDIA/TransformerEngine.git@release_v2.12
-# "
-echo "Step 8: TransformerEngine SKIPPED (uncomment in script if FP8 training is needed)"
+ Step 8: TransformerEngine v2.12 — OPTIONAL (FP8 training only, not needed for vllm inference)
+ Uncomment below if you need FP8 training with Megatron-LM / verl:
+
+ SP="${ENV_PATH}/lib/python3.12/site-packages"
+ conda run -n "${ENV_NAME}" bash -c "
+   export NVTE_FRAMEWORK=pytorch
+   export CPATH=\"${ENV_PATH}/include:${SP}/nvidia/nvtx/include:${SP}/nvidia/nccl/include:${SP}/nvidia/cudnn/include:${SP}/nvidia/cuda_runtime/include:${SP}/nvidia/cuda_nvrtc/include:\${CPATH:-}\"
+   export LIBRARY_PATH=\"${ENV_PATH}/lib:${SP}/nvidia/nccl/lib:${SP}/nvidia/cudnn/lib:\${LIBRARY_PATH:-}\"
+   MAX_JOBS=16 NVTE_BUILD_THREADS_PER_JOB=4 \
+   pip3 install --resume-retries 999 --no-build-isolation \
+     git+https://github.com/NVIDIA/TransformerEngine.git@release_v2.12
+"
 
 echo "========================================"
 echo " Step 9: Install misc Python packages"
@@ -103,22 +102,17 @@ echo " Step 13: Install nvtx, matplotlib, liger_kernel"
 echo "========================================"
 conda run -n "${ENV_NAME}" pip3 install nvtx matplotlib liger_kernel
 
-#echo "========================================"
-#echo " Step 14: Install mbridge"
-#echo "========================================"
-#conda run -n "${ENV_NAME}" pip install -U \
-#  git+https://github.com/ISEEKYAN/mbridge.git@641a5a0
+echo "========================================"
+echo " Step 14: Install mbridge"
+echo "========================================"
+conda run -n "${ENV_NAME}" pip install -U \
+  git+https://github.com/ISEEKYAN/mbridge.git@641a5a0
 
-echo "Step 14: mbridge SKIPPED (bridge library between Megatron-LM and vllm (for weight loading))"
-
-
-#echo "========================================"
-#echo " Step 15: Install Megatron-LM (no-deps)"
-#echo "========================================"
-#conda run -n "${ENV_NAME}" pip install --no-deps \
-#  git+https://github.com/NVIDIA/Megatron-LM.git@core_v0.16.0
-
-echo "Step 15: Megatron-LM SKIPPED (large-scale distributed training framework. Only needed for training transformer models with tensor/pipeline parallelism at scale)"
+echo "========================================"
+echo " Step 15: Install Megatron-LM (no-deps)"
+echo "========================================"
+conda run -n "${ENV_NAME}" pip install --no-deps \
+  git+https://github.com/NVIDIA/Megatron-LM.git@core_v0.16.0
 
 echo "========================================"
 echo " Step 16: Install transformers 5.3.0"

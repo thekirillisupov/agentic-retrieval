@@ -401,4 +401,10 @@ class RetrievalReActAgentLoop(AgentLoopBase):
             num_turns=num_assistant_turns,
             metrics=agent_metrics,
             extra_fields=extra_fields,
+            # Text-only rollout. Must be {} (not the default None) — verl's
+            # _compute_multi_modal_inputs unconditionally calls
+            # output.multi_modal_data.get("images") when self.processor is
+            # not None (true for any Qwen-VL/Qwen3.5-VL checkpoint, even
+            # when the inputs are text-only).
+            multi_modal_data={},
         )
