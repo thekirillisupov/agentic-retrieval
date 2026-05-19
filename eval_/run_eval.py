@@ -139,10 +139,13 @@ def main() -> None:
     parser.add_argument("--config", default="configs/default.yaml")
     parser.add_argument("--budget-sweep", action="store_true")
     parser.add_argument("--out", default="data/processed/musique/agent_results.json")
+    parser.add_argument("--model-name", default=None, help="Override model.name from config")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     cfg = yaml.safe_load(Path(args.config).read_text())
+    if args.model_name:
+        cfg["model"]["name"] = args.model_name
 
     if args.budget_sweep:
         sweep = cfg["eval"].get("budget_sweep", [1, 3, 5, 8])

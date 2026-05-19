@@ -35,9 +35,12 @@ export VLLM_USE_V1=1
 # strategies are mutually exclusive. OOM on the Adam step is mitigated by
 # the actor's param_offload + grad_offload + optimizer_offload settings.
 
+# Use scripts/main_ppo.py (a thin wrapper around verl.trainer.main_ppo) so that
+# the `algorithm.filter_groups` block in the config produces would-be-filtered
+# / effective-batch-size diagnostics in WandB. See grpo/filter_groups_metrics.py.
 CUDA_VISIBLE_DEVICES="${GPUS}" \
 PYTHONPATH=".:${PYTHONPATH:-}" \
-python -m verl.trainer.main_ppo \
+python scripts/main_ppo.py \
     --config-path "$(realpath "$(dirname "${CONFIG}")")" \
     --config-name "$(basename "${CONFIG}" .yaml)" \
     trainer.n_gpus_per_node="${N_GPUS}" \

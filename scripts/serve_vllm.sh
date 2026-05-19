@@ -7,6 +7,7 @@
 # Thinking is off by default: faster rollouts, and avoids vLLM 0.19's reasoning-parser
 # bug where <tool_call> emitted inside <think> blocks never reaches the tool parser
 # (https://github.com/vllm-project/vllm/issues/39056). Set ENABLE_THINKING=true to opt in.
+# Usage: MODEL=Qwen/Qwen3-14B bash scripts/serve_vllm.sh
 set -euo pipefail
 
 MODEL="${MODEL:-Qwen/Qwen3.5-35B-A3B}"

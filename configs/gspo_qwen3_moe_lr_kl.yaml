@@ -46,13 +46,13 @@ algorithm:
   adv_estimator: grpo                  # group-relative advantages (GSPO keeps these)
   norm_adv_by_std_in_grpo: true
   use_kl_in_reward: true
-  kl_coef: 0.001
+  kl_coef: 0.003
   gamma: 1.0
   lam: 1.0
   filter_groups:
     enable: true
     metric: score
-    max_num_gen_batches: 4 # how many fresh dataloader batches you'll spend trying to assemble one update batch 
+    max_num_gen_batches: 0 # how many fresh dataloader batches you'll spend trying to assemble one update batch 
     # max_num_gen_batches * batch_size * rollouts_n
 
 actor_rollout_ref:
@@ -82,7 +82,7 @@ actor_rollout_ref:
     clip_ratio_c: 10.0
 
     optim:
-      lr: 1.0e-6                       # full fine-tune LR (recipe default)
+      lr: 5.0e-7                       # full fine-tune LR (recipe default)
       weight_decay: 0.0
       lr_decay_style: cosine           # Megatron uses lr_decay_style (not warmup_style)
       lr_warmup_steps_ratio: 0.03
