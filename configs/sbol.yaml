@@ -32,7 +32,7 @@ index:
 agent:
   max_turns: 8
   max_tool_calls: 10
-  prompt_version: v1_ru
+  prompt_version: v1
 
 eval:
   raw_sbol_dir: ./data/raw/sbol/

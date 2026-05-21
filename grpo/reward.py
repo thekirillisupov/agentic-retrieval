@@ -6,6 +6,7 @@ Reward
     r = alpha * NDCG@k + (1 - alpha) * F_beta(output)
         - length_penalty
         + format_penalty
+        + answer_bonus * [stopped_reason == "answer"]
 
 * ``alpha`` mixes a graded ranking signal (NDCG) with a recall-oriented
   set-quality signal (F_beta over the answered list). Defaults follow the
@@ -17,6 +18,11 @@ Reward
 * ``format_penalty`` (``parse_error_penalty``) is applied only when the
   rollout ends in ``parse_error``; both ranking metrics are zeroed in that
   case so the model only ever gets credit for ranked output it produced.
+* ``answer_bonus`` (epsilon) is a small additive bonus applied iff the
+  rollout terminates by emitting an ``answer`` (rather than running out of
+  turns / tool calls / parse errors). It nudges the policy toward decisive
+  termination without dominating the ranking signal; recommended range
+  0.02-0.05.
 
 Per-rollout metrics returned (consumed by veRL aggregation / the trajectory
 log via ``extra_fields``):
@@ -65,6 +71,7 @@ DEFAULTS = {
     "length_alpha": 0.0,            # length penalty OFF by default; opt-in
     "length_target_tokens": 4096,
     "parse_error_penalty": 0.0,     # set to e.g. -0.1 to punish malformed outputs
+    "answer_bonus": 0.0,            # epsilon added when stopped_reason == "answer"
 }
 
 
@@ -112,6 +119,7 @@ def compute_score(
     length_alpha = float(cfg["length_alpha"])
     target = max(1, int(cfg["length_target_tokens"]))
     parse_pen = float(cfg["parse_error_penalty"])
+    answer_bonus = float(cfg["answer_bonus"])
 
     gold_list = _gold_from_ground_truth(ground_truth, extra_info)
     gold = set(gold_list)
@@ -140,8 +148,11 @@ def compute_score(
     overrun = max(0, response_len - target)
     len_pen = min(1.0, length_alpha * (overrun / target)) if length_alpha > 0 else 0.0
 
+    answered = stopped == "answer"
+    answer_bonus_val = answer_bonus if answered else 0.0
+
     composite = alpha * ndcg + (1.0 - alpha) * fbeta_val
-    score = composite - len_pen + format_penalty
+    score = composite - len_pen + format_penalty + answer_bonus_val
 
     return {
         "score": float(score),
@@ -153,8 +164,9 @@ def compute_score(
         "recall": float(recall),
         "length_penalty": float(len_pen),
         "format_penalty": float(format_penalty),
+        "answer_bonus": float(answer_bonus_val),
         "response_len": float(response_len),
         "stopped_reason": stopped,
         "num_tool_calls": float(info.get("num_tool_calls", 0)),
-        "answered": float(stopped == "answer"),
+        "answered": float(answered),
     }

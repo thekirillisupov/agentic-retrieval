@@ -2,7 +2,7 @@
 
 Reads data/raw/sbol/faq_index_28_apr.json and produces:
   {out_dir}/corpus.jsonl  — one passage per FAQ entry
-  {out_dir}/eval.jsonl    — one eval row per alternative_question
+  {out_dir}/eval.jsonl    — one eval row per FAQ entry (main question)
 
 Document text format:
     Вопрос:{question}
@@ -12,9 +12,8 @@ Document text format:
 doc_id is derived from the FAQ entry's metadata.question_id:
     sbol_<question_id>
 
-Eval rows use alternative_questions as the retrieval query and the
-parent FAQ doc_id as the single gold document.  Entries with no
-alternative_questions produce no eval rows.
+Eval rows use the FAQ entry's main question as the retrieval query and
+the parent FAQ doc_id (sbol_<question_id>) as the single gold document.
 """
 
 from __future__ import annotations
@@ -61,17 +60,18 @@ def parse(raw_path: Path, out_dir: Path) -> tuple[int, int]:
             cf.write("\n")
             num_corpus += 1
 
-            for i, alt_q in enumerate(meta.get("alternative_questions", [])):
-                if not alt_q:
-                    continue
-                row = {
-                    "question_id": f"{doc_id}_alt_{i}",
-                    "question": alt_q,
-                    "gold_doc_ids": [doc_id],
-                }
-                ef.write(json.dumps(row, ensure_ascii=False))
-                ef.write("\n")
-                num_eval += 1
+            if not question:
+                log.warning("entry missing question, skipping eval: %s", doc_id)
+                continue
+
+            row = {
+                "question_id": doc_id,
+                "question": question,
+                "gold_doc_ids": [doc_id],
+            }
+            ef.write(json.dumps(row, ensure_ascii=False))
+            ef.write("\n")
+            num_eval += 1
 
     log.info("wrote %d corpus entries to %s", num_corpus, corpus_path)
     log.info("wrote %d eval rows to %s", num_eval, eval_path)

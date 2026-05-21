@@ -46,13 +46,13 @@ algorithm:
   adv_estimator: grpo                  # group-relative advantages (GSPO keeps these)
   norm_adv_by_std_in_grpo: true
   use_kl_in_reward: true
-  kl_coef: 0.001
+  kl_coef: 0.003
   gamma: 1.0
   lam: 1.0
   filter_groups:
     enable: true
     metric: score
-    max_num_gen_batches: 4 # how many fresh dataloader batches you'll spend trying to assemble one update batch 
+    max_num_gen_batches: 0 # how many fresh dataloader batches you'll spend trying to assemble one update batch 
     # max_num_gen_batches * batch_size * rollouts_n
 
 actor_rollout_ref:
@@ -82,12 +82,13 @@ actor_rollout_ref:
     clip_ratio_c: 10.0
 
     optim:
-      lr: 1.0e-6                       # full fine-tune LR (recipe default)
+      lr: 5.0e-7                       # full fine-tune LR (recipe default)
       weight_decay: 0.0
       lr_decay_style: cosine           # Megatron uses lr_decay_style (not warmup_style)
       lr_warmup_steps_ratio: 0.03
       min_lr: 1.0e-7                   # 10% of peak LR (Megatron expects absolute min_lr)
       clip_grad: 1.0
+      use_checkpoint_opt_param_scheduler: true   # restore num_steps from ckpt so warmup isn't replayed
       override_optimizer_config:
         optimizer_offload_fraction: 1
         overlap_cpu_optimizer_d2h_h2d: true
@@ -185,13 +186,16 @@ reward:
     path: grpo/reward.py
     name: compute_score
     reward_kwargs:
-      # r = alpha * NDCG@k + (1 - alpha) * F_beta(output)  -  length_penalty
+      # r = alpha * NDCG@k + (1 - alpha) * F_beta(output)
+      #   - length_penalty + format_penalty
+      #   + answer_bonus * [stopped_reason == "answer"]
       ndcg_k: 10
       alpha: 0.7
       f_beta: 2.0
       length_alpha: 0.0              # length penalty is OPTIONAL; set >0 to enable
       length_target_tokens: 8192
       parse_error_penalty: 0.0
+      answer_bonus: 0.0             # epsilon in [0.02, 0.05]; nudge model to emit `answer`
 
 agent_loop:
   retrieval_react:
@@ -212,7 +216,7 @@ trainer:
   n_gpus_per_node: 8
   save_freq: 10
   max_actor_ckpt_to_keep: 1
-  test_freq: 1
+  test_freq: 2
   logger: ['console', 'wandb']
   default_local_dir: checkpoints/gspo_qwen3_moe/
   val_before_train: true

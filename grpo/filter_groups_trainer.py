@@ -62,6 +62,15 @@ Implementation notes:
             Total unique prompt groups generated across all gen batches
             this step (=
             ``num_gen_batches * data.train_batch_size``).
+      * ``filter_groups/n_filtered_all_zero``
+            Among the dropped (zero-variance) groups across all gen
+            batches this step, how many had every rollout score exactly
+            0 (model fully failed). Computed pre-filter — overrides the
+            post-filter 0 emitted by
+            :mod:`grpo.filter_groups_metrics`.
+      * ``filter_groups/n_filtered_all_one``
+            Same as above but for groups where every rollout scored
+            exactly 1 (model fully saturated).
 """
 
 from __future__ import annotations
@@ -102,24 +111,39 @@ from verl.trainer.ppo.utils import Role
 log = logging.getLogger(__name__)
 
 
-def _compute_kept_uids(uids: np.ndarray, metric_vals: np.ndarray) -> tuple[list, int]:
-    """Return ``(kept_uid_list, n_filtered)`` for the DAPO filter rule.
+def _compute_kept_uids(
+    uids: np.ndarray, metric_vals: np.ndarray
+) -> tuple[list, int, int, int]:
+    """Return ``(kept_uid_list, n_filtered, n_all_zero, n_all_one)`` for the
+    DAPO filter rule.
 
     A group is kept iff its per-rollout metric values have ``std > 0``,
     matching the DAPO recipe (``recipe/dapo/dapo_ray_trainer.py``).
     Singleton groups (``len(vals) == 1``) are always kept — DAPO does
     the same.
+
+    ``n_all_zero`` / ``n_all_one`` count, among the dropped (zero-variance)
+    groups, how many had every rollout score exactly 0 or 1 respectively.
+    Computed here — i.e. *before* the kept rows are extracted from
+    ``new_batch`` — so downstream wandb keys reflect the pre-filter view.
     """
     prompt_uid2metric_vals: dict = defaultdict(list)
     for uid, metric_val in zip(uids, metric_vals, strict=True):
         prompt_uid2metric_vals[uid].append(metric_val)
-    kept = [
-        uid
-        for uid, vals in prompt_uid2metric_vals.items()
-        if np.std(vals) > 0 or len(vals) == 1
-    ]
+    kept: list = []
+    n_all_zero = 0
+    n_all_one = 0
+    for uid, vals in prompt_uid2metric_vals.items():
+        if np.std(vals) > 0 or len(vals) == 1:
+            kept.append(uid)
+            continue
+        v = float(vals[0])
+        if v == 0.0:
+            n_all_zero += 1
+        elif v == 1.0:
+            n_all_one += 1
     n_filtered = len(prompt_uid2metric_vals) - len(kept)
-    return kept, n_filtered
+    return kept, n_filtered, n_all_zero, n_all_one
 
 
 class FilterGroupsRayPPOTrainer(RayPPOTrainer):
@@ -214,6 +238,8 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
         num_prompt_in_batch = 0
         num_gen_batches = 0
         total_filtered_groups = 0
+        total_filtered_all_zero = 0
+        total_filtered_all_one = 0
         # -------------------------------------------------------------------------
 
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
@@ -350,11 +376,13 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
                                 )
 
                         metric_vals = np.asarray(new_batch.non_tensor_batch[fg_metric])
-                        kept_uids, n_filtered = _compute_kept_uids(
+                        kept_uids, n_filtered, n_all_zero, n_all_one = _compute_kept_uids(
                             new_batch.non_tensor_batch["uid"], metric_vals
                         )
 
                         total_filtered_groups += n_filtered
+                        total_filtered_all_zero += n_all_zero
+                        total_filtered_all_one += n_all_one
                         num_prompt_in_batch += len(kept_uids)
                         num_gen_batches += 1
 
@@ -644,6 +672,12 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
                     metrics["filter_groups/total_generated_groups"] = float(
                         num_gen_batches * train_bsz
                     )
+                    # Pre-filter breakdown of dropped (zero-variance) groups by
+                    # their common metric value. Overrides the post-filter 0s
+                    # emitted by ``compute_filter_groups_metrics`` (which sees
+                    # the trimmed batch, where n_filtered is always 0).
+                    metrics["filter_groups/n_filtered_all_zero"] = float(total_filtered_all_zero)
+                    metrics["filter_groups/n_filtered_all_one"] = float(total_filtered_all_one)
 
                 if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
                     self.train_dataloader.sampler.update(batch=batch)
@@ -679,3 +713,5 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
                 num_prompt_in_batch = 0
                 num_gen_batches = 0
                 total_filtered_groups = 0
+                total_filtered_all_zero = 0
+                total_filtered_all_one = 0

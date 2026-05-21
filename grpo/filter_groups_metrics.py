@@ -34,10 +34,17 @@ Metrics emitted (always, regardless of whether filtering is on):
 
 * ``filter_groups/n_groups``              unique groups (uids) in the batch
 * ``filter_groups/n_filtered``            groups with zero-variance metric
-* ``filter_groups/n_filtered_all_zero``   filtered groups where every rollout scored 0 (mean == 0)
-* ``filter_groups/n_filtered_all_one``    filtered groups where every rollout scored 1 (mean == 1)
+* ``filter_groups/n_filtered_all_zero``   filtered groups where every rollout scored 0 (mean == 0).
+                                          When ``filter_groups.enable=True`` the trainer overwrites
+                                          this with the accumulated pre-filter count across all gen
+                                          batches (see :mod:`grpo.filter_groups_trainer`); the value
+                                          emitted here on the post-filter batch is always 0 in that
+                                          case and is meaningful only in the ``enable=False``
+                                          what-if view.
+* ``filter_groups/n_filtered_all_one``    filtered groups where every rollout scored 1 (mean == 1);
+                                          same trainer-override semantics as ``n_filtered_all_zero``.
 * ``filter_groups/n_kept``                ``n_groups - n_filtered``
-* ``filter_groups/n_not_filtered_zero``   total traces in kept groups whose mean reward is 0 (sum of rollout counts)
+* ``filter_groups/n_not_filtered_zero``   traces in kept groups that individually scored <=0 (per-row count)
 * ``filter_groups/filter_ratio``          ``n_filtered / n_groups``
 * ``filter_groups/effective_batch_size``  ``n_kept * rollout.n``
 * ``filter_groups/nominal_batch_size``    ``n_groups * rollout.n``
@@ -148,17 +155,22 @@ def compute_filter_groups_metrics(
 
     # Groups whose mean reward is exactly zero (all rollouts produced 0).
     is_zero_mean = means == 0.0
-
     is_one_mean = means == 1.0
 
     # Filtered groups split by whether every rollout scored zero or one.
+    # Note: with filter_groups.enable=True these will always be 0 because the
+    # batch reaching compute_data_metrics is already post-filter (n_filtered==0).
+    # They are meaningful only in the enable=False what-if view.
     n_filtered_all_zero = int((is_filtered & is_zero_mean).sum())
     n_filtered_all_one = int((is_filtered & is_one_mean).sum())
 
-    # Number of traces (individual rollout rows) that belong to a kept group
-    # whose mean reward is zero — summed over all such groups.
-    not_filtered_zero_mask = ~is_filtered & is_zero_mean
-    n_not_filtered_zero = int(counts[not_filtered_zero_mask].sum())
+    # Number of traces (individual rollout rows) in non-filtered groups that
+    # individually scored <= 0. Checking per-row rather than group mean because
+    # a kept group (non-zero variance) always has mixed scores — its mean is
+    # virtually never exactly 0 even when many rollouts scored 0.
+    not_filtered_group_mask = ~is_filtered
+    per_row_in_kept = not_filtered_group_mask[inverse]  # shape: (n_rows,)
+    n_not_filtered_zero = int((per_row_in_kept & (vals <= 0.0)).sum())
 
     return {
         "filter_groups/n_groups": float(n_groups),
