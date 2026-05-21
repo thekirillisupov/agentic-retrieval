@@ -1,33 +1,49 @@
-"""NDCG@k reward for GRPO.
+"""Composite NDCG@k + F_beta reward for GRPO/GSPO.
 
-Three things to be careful about, all driven by the user's spec:
+Reward
+------
 
-1. **NDCG over gold ids.** We reuse `eval_.metrics.ndcg_at_k` so the reward
-   number printed during training is exactly comparable to the eval-time
-   number printed by `eval_.run_eval`. No accidental drift between the two.
+    r = alpha * NDCG@k + (1 - alpha) * F_beta(output)
+        - length_penalty
+        + format_penalty
+        + answer_bonus * [stopped_reason == "answer"]
 
-2. **Length normalisation.** GRPO already does token-level loss aggregation
-   (`actor.loss_agg_mode=token-mean`), which removes most length bias inside
-   the optimiser. *In addition*, we apply a small explicit penalty per
-   response token at the reward level:
+* ``alpha`` mixes a graded ranking signal (NDCG) with a recall-oriented
+  set-quality signal (F_beta over the answered list). Defaults follow the
+  GSPO-MoE recipe the user requested: ``alpha=0.7``, ``beta=2.0``, ``k=10``.
+* ``length_penalty`` is one-sided and OFF by default (``length_alpha=0.0``).
+  GRPO/GSPO already aggregate the loss per token (``actor.loss_agg_mode``);
+  the explicit penalty is kept here as an *option* to discourage runaway
+  tool-call loops if you observe length blowups during training.
+* ``format_penalty`` (``parse_error_penalty``) is applied only when the
+  rollout ends in ``parse_error``; both ranking metrics are zeroed in that
+  case so the model only ever gets credit for ranked output it produced.
+* ``answer_bonus`` (epsilon) is a small additive bonus applied iff the
+  rollout terminates by emitting an ``answer`` (rather than running out of
+  turns / tool calls / parse errors). It nudges the policy toward decisive
+  termination without dominating the ranking signal; recommended range
+  0.02-0.05.
 
-       r = ndcg - alpha * (response_len - target_len).clip(min=0) / target_len
+Per-rollout metrics returned (consumed by veRL aggregation / the trajectory
+log via ``extra_fields``):
 
-   This is a one-sided penalty: short rollouts get full credit, long ones get
-   docked. ``alpha=0`` recovers pure NDCG. The default (``alpha=0.05``,
-   ``target_len=2048``) is gentle enough to leave the gradient direction
-   dominated by NDCG while discouraging runaway tool-call loops.
+    score             - the scalar driving the policy update
+    ndcg              - NDCG@k over the answered list vs. gold
+    dcg               - DCG@k over the answered list vs. gold (raw, un-normalised)
+    f_beta            - F_beta over the answered list vs. gold (the term used in r)
+    f_beta_at_output  - alias for f_beta, exposed as a separately-named metric
+    precision         - precision over the answered list
+    recall            - recall over the answered list
+    length_penalty    - the value subtracted from r (>=0)
+    format_penalty    - the value added to r (typically <=0)
+    response_len      - tokens the policy produced this rollout
+    stopped_reason    - terminal state of the rollout
+    num_tool_calls    - number of tool calls executed
+    answered          - 1.0 iff the rollout ended in ``answer``
 
-3. **Format / shape penalties.** A run that ends in `parse_error` or
-   `max_turns` with no answer gets reward = 0 even if the seen set happens to
-   contain a gold id by accident — we only credit the model for ranked output
-   it actually produced. Stop reasons are surfaced as auxiliary metrics so
-   filter_groups can see them when computing zero-variance flags.
-
-Filtering zero-variance groups is veRL's responsibility (see
-``algorithm.filter_groups`` in the trainer config). All this function has to
-do is return a stable scalar per rollout; veRL groups by ``uid`` and drops
-groups whose reward variance is zero before the policy update.
+Filtering zero-variance groups stays veRL's responsibility (see
+``algorithm.filter_groups`` in the trainer config); this function just has to
+return a stable scalar per rollout.
 """
 
 from __future__ import annotations
@@ -36,7 +52,13 @@ import json
 import logging
 from typing import Any
 
-from eval_.metrics import ndcg_at_k
+from eval_.metrics import (
+    dcg_at_k,
+    f_beta,
+    ndcg_at_k,
+    simple_precision,
+    simple_recall,
+)
 
 log = logging.getLogger(__name__)
 
@@ -44,9 +66,12 @@ log = logging.getLogger(__name__)
 # Default knobs; can be overridden via reward_kwargs in the trainer config.
 DEFAULTS = {
     "ndcg_k": 10,
-    "length_alpha": 0.05,
-    "length_target_tokens": 2048,
-    "parse_error_penalty": 0.0,  # set to e.g. -0.1 to punish malformed outputs
+    "alpha": 0.7,                   # NDCG weight; (1 - alpha) goes to F_beta
+    "f_beta": 2.0,                  # beta for F_beta (beta>1 => recall-heavy)
+    "length_alpha": 0.0,            # length penalty OFF by default; opt-in
+    "length_target_tokens": 4096,
+    "parse_error_penalty": 0.0,     # set to e.g. -0.1 to punish malformed outputs
+    "answer_bonus": 0.0,            # epsilon added when stopped_reason == "answer"
 }
 
 
@@ -84,42 +109,64 @@ def compute_score(
 ) -> dict[str, float]:
     """Reward callback signature expected by veRL's ``custom_reward_function``.
 
-    Returns a dict with ``score`` (the scalar driving GRPO) plus auxiliary
+    Returns a dict with ``score`` (the scalar driving GRPO/GSPO) plus auxiliary
     metrics for logging / filter_groups.
     """
     cfg = {**DEFAULTS, **{k: v for k, v in (kwargs or {}).items() if k in DEFAULTS}}
     k = int(cfg["ndcg_k"])
-    alpha = float(cfg["length_alpha"])
+    alpha = float(cfg["alpha"])
+    beta = float(cfg["f_beta"])
+    length_alpha = float(cfg["length_alpha"])
     target = max(1, int(cfg["length_target_tokens"]))
     parse_pen = float(cfg["parse_error_penalty"])
+    answer_bonus = float(cfg["answer_bonus"])
 
-    gold = _gold_from_ground_truth(ground_truth, extra_info)
+    gold_list = _gold_from_ground_truth(ground_truth, extra_info)
+    gold = set(gold_list)
     ranked, info = _ranked_from_extra(extra_info)
     stopped = str(info.get("stopped_reason", "unknown"))
     response_len = int(info.get("response_len", info.get("active_response_len", 0)))
 
-    if stopped == "parse_error":
+    if stopped == "parse_error" or not gold:
         ndcg = 0.0
-        format_penalty = parse_pen
+        dcg = 0.0
+        precision = 0.0
+        recall = 0.0
+        fbeta_val = 0.0
+        format_penalty = parse_pen if stopped == "parse_error" else 0.0
     else:
-        ndcg = ndcg_at_k(ranked, set(gold), k=k) if gold else 0.0
+        ndcg = ndcg_at_k(ranked, gold, k=k)
+        dcg = dcg_at_k(ranked, gold, k=k)
+        precision = simple_precision(ranked, gold)
+        recall = simple_recall(ranked, gold)
+        fbeta_val = f_beta(precision, recall, beta=beta)
         format_penalty = 0.0
 
-    # One-sided length penalty in [0, 1+] applied to the reward, so longer
-    # rollouts get docked. We cap at 1.0 of penalty to avoid driving rewards
-    # arbitrarily negative.
+    # One-sided length penalty in [0, 1] applied to the reward; longer rollouts
+    # get docked. Capped at 1.0 to avoid driving rewards arbitrarily negative.
+    # length_alpha=0.0 disables the penalty entirely (default).
     overrun = max(0, response_len - target)
-    len_pen = min(1.0, alpha * (overrun / target)) if alpha > 0 else 0.0
+    len_pen = min(1.0, length_alpha * (overrun / target)) if length_alpha > 0 else 0.0
 
-    score = ndcg - len_pen + format_penalty
+    answered = stopped == "answer"
+    answer_bonus_val = answer_bonus if answered else 0.0
+
+    composite = alpha * ndcg + (1.0 - alpha) * fbeta_val
+    score = composite - len_pen + format_penalty + answer_bonus_val
 
     return {
         "score": float(score),
         "ndcg": float(ndcg),
+        "dcg": float(dcg),
+        "f_beta": float(fbeta_val),
+        "f_beta_at_output": float(fbeta_val),
+        "precision": float(precision),
+        "recall": float(recall),
         "length_penalty": float(len_pen),
         "format_penalty": float(format_penalty),
+        "answer_bonus": float(answer_bonus_val),
         "response_len": float(response_len),
-        "stopped_reason": stopped,  # string passes through veRL metric agg as-is
+        "stopped_reason": stopped,
         "num_tool_calls": float(info.get("num_tool_calls", 0)),
-        "answered": float(stopped == "answer"),
+        "answered": float(answered),
     }

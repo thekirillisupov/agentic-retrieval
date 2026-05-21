@@ -159,12 +159,18 @@ class AgentHarness:
                 break
 
             # Drop hallucinated ids that the agent never actually retrieved.
+            # Deduplicate by first occurrence so the model cannot game NDCG/recall
+            # by repeating the same doc_id multiple times.
             valid: list[str] = []
+            seen_in_answer: set[str] = set()
             for doc_id in answer:
-                if doc_id in seen:
-                    valid.append(doc_id)
-                else:
+                if doc_id not in seen:
                     log.warning("Hallucinated doc_id in answer, dropping: %s", doc_id)
+                elif doc_id in seen_in_answer:
+                    log.warning("Duplicate doc_id in answer, dropping: %s", doc_id)
+                else:
+                    valid.append(doc_id)
+                    seen_in_answer.add(doc_id)
             ranked_doc_ids = valid
             stopped_reason = "answer"
             break

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run baseline + agent eval. Assumes vLLM and tool server are already up.
-# Usage: CONFIG=configs/musique.yaml bash scripts/run_eval.sh
+# Usage: CONFIG=configs/musique.yaml MODEL_NAME=checkpoints/gspo_qwen3_moe/global_step_60/hf_model bash scripts/run_eval.sh
 set -euo pipefail
 
 CONFIG="${CONFIG:-configs/default.yaml}"

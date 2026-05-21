@@ -317,7 +317,14 @@ class RetrievalReActAgentLoop(AgentLoopBase):
                 if answer is None:
                     stopped_reason = "parse_error"
                 else:
-                    ranked_doc_ids = [d for d in answer if d in seen]
+                    # Deduplicate by first occurrence so the model cannot game
+                    # NDCG/recall by repeating the same doc_id multiple times.
+                    _seen_ans: set[str] = set()
+                    ranked_doc_ids = []
+                    for _d in answer:
+                        if _d in seen and _d not in _seen_ans:
+                            ranked_doc_ids.append(_d)
+                            _seen_ans.add(_d)
                     stopped_reason = "answer"
                 break
 

@@ -19,7 +19,19 @@ class MetricResult:
     f1: float
 
 
+def _dedup_ranked(predicted: list[str]) -> list[str]:
+    """Return predicted with duplicates removed, preserving first-occurrence order."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for doc_id in predicted:
+        if doc_id not in seen:
+            result.append(doc_id)
+            seen.add(doc_id)
+    return result
+
+
 def simple_precision(predicted: list[str], gold: set[str]) -> float:
+    predicted = _dedup_ranked(predicted)
     if not predicted:
         return 0.0
     hits = sum(1 for p in predicted if p in gold)
@@ -27,6 +39,7 @@ def simple_precision(predicted: list[str], gold: set[str]) -> float:
 
 
 def simple_recall(predicted: list[str], gold: set[str]) -> float:
+    predicted = _dedup_ranked(predicted)
     if not gold:
         return 0.0
     hits = sum(1 for p in predicted if p in gold)
@@ -39,9 +52,21 @@ def simple_f1(precision: float, recall: float) -> float:
     return 2 * precision * recall / (precision + recall)
 
 
+def f_beta(precision: float, recall: float, beta: float) -> float:
+    """F_beta score: (1+beta^2) * P * R / (beta^2 * P + R).
+
+    beta>1 weights recall more (e.g. beta=2), beta<1 weights precision more.
+    """
+    b2 = beta * beta
+    denom = b2 * precision + recall
+    if denom == 0.0:
+        return 0.0
+    return (1.0 + b2) * precision * recall / denom
+
+
 def dcg_at_k(predicted: list[str], gold: set[str], k: int) -> float:
     dcg = 0.0
-    for i, doc_id in enumerate(predicted[:k], start=1):
+    for i, doc_id in enumerate(_dedup_ranked(predicted)[:k], start=1):
         if doc_id in gold:
             dcg += 1.0 / math.log2(i + 1)
     return dcg
@@ -58,6 +83,7 @@ def ndcg_at_k(predicted: list[str], gold: set[str], k: int) -> float:
     idcg = idcg_at_k(len(gold), k)
     if idcg == 0.0:
         return 0.0
+    # dcg_at_k already deduplicates; pass through for consistency
     return dcg_at_k(predicted, gold, k) / idcg
 
 
