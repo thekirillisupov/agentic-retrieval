@@ -38,7 +38,9 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import re
+import time
 import uuid
 from typing import Any
 
@@ -90,6 +92,7 @@ except Exception:  # pragma: no cover - verl optional at import time
         def _wrap(cls):
             cls._registered_name = name
             return cls
+
         return _wrap
 
     def rollout_trace_op(fn):  # type: ignore[no-redef]
@@ -107,7 +110,11 @@ except Exception:  # pragma: no cover - verl optional at import time
 
 
 from agent.parser import parse_answer
-from agent.prompts import LOCAL_SEARCH_TOOL_SCHEMA, render_search_results
+from agent.prompts import (
+    get_tool_schemas,
+    render_grep_results,
+    render_search_results,
+)
 
 log = logging.getLogger(__name__)
 
@@ -185,7 +192,9 @@ class RetrievalReActAgentLoop(AgentLoopBase):
         super().__init__(*args, **kwargs)
 
         rc = self.rollout_config
-        self.max_assistant_turns = int(getattr(rc.multi_turn, "max_assistant_turns", 8) or 8)
+        self.max_assistant_turns = int(
+            getattr(rc.multi_turn, "max_assistant_turns", 8) or 8
+        )
         self.max_user_turns = int(getattr(rc.multi_turn, "max_user_turns", 0) or 0)
         self.max_tool_response_length = int(
             getattr(rc.multi_turn, "max_tool_response_length", 4096) or 4096
@@ -207,48 +216,214 @@ class RetrievalReActAgentLoop(AgentLoopBase):
 
         def _g(key: str, default: Any) -> Any:
             try:
-                v = retr_cfg.get(key, default) if hasattr(retr_cfg, "get") else getattr(
-                    retr_cfg, key, default
+                v = (
+                    retr_cfg.get(key, default)
+                    if hasattr(retr_cfg, "get")
+                    else getattr(retr_cfg, key, default)
                 )
             except Exception:
                 v = default
             return v if v is not None else default
 
-        self.tool_server_url = str(_g("tool_server_url", "http://localhost:8100")).rstrip("/")
-        self.tool_timeout_s = float(_g("tool_timeout_s", 30.0))
+        self.tool_server_url = str(
+            _g("tool_server_url", "http://localhost:8100")
+        ).rstrip("/")
+        self.tool_timeout_s = float(_g("tool_timeout_s", 60.0))
         self.max_tool_calls = int(_g("max_tool_calls", 10))
         self.top_k_default = int(_g("top_k_default", 10))
         self.top_k_max = int(_g("top_k_max", 50))
+        # Comma-separated list of tool names to expose, e.g. "local_search" or
+        # "search,grep" for the extending prompt variant.
+        _raw_tools = str(_g("tool_names", "local_search"))
+        self.tool_names: set[str] = {
+            t.strip() for t in _raw_tools.split(",") if t.strip()
+        }
+        # After this many consecutive tool-server failures the worker triggers
+        # a /reload on the server. Set to 0 to disable the circuit breaker.
+        # Sized for ~128 agent workers: a single brownout (e.g. weight-update
+        # spike) can produce a short burst of timeouts across many workers
+        # at once. The /reload endpoint is singleflight + cooldown on the
+        # server side, so multiple workers tripping the breaker together is
+        # cheap, but the threshold should still be lax enough to absorb a
+        # transient blip without aborting the worker.
+        self.max_consecutive_tool_errors = int(_g("max_consecutive_tool_errors", 20))
+        # Timeout (seconds) for the /reload request. Index reload can be slow
+        # on a large FAISS corpus, so allow generous headroom.
+        self.recovery_wait_s = float(_g("recovery_wait_s", 120.0))
 
         self._http = httpx.AsyncClient(timeout=self.tool_timeout_s)
+        self._consecutive_tool_errors: int = 0
+
+        # Fail fast: verify the tool server is reachable before any rollout.
+        self._check_tool_server_health()
+
+    # ---------------------------------------------------------- health / circuit
+
+    def _check_tool_server_health(self) -> None:
+        """Synchronous startup ping — raises RuntimeError if the server is unreachable.
+
+        128 rollout workers all call this at the same instant during training
+        startup, which would otherwise stampede the server's anyio threadpool
+        (default ~40) even though ``/healthz`` is now ``async def``. Retry on
+        transient connect/read timeouts with jittered backoff; only treat a
+        genuine 5xx/503 as a permanent failure.
+        """
+        import httpx as _httpx
+
+        url = f"{self.tool_server_url}/healthz"
+        max_attempts = 5
+        per_attempt_timeout = 30.0
+        last_exc: Exception | None = None
+
+        for attempt in range(1, max_attempts + 1):
+            # Jittered backoff de-correlates the 128 workers so retries don't
+            # re-stampede the server. attempt==1 has no extra wait.
+            if attempt > 1:
+                backoff = min(2.0 ** (attempt - 2), 8.0) + random.uniform(0.0, 1.0)
+                time.sleep(backoff)
+            try:
+                resp = _httpx.get(url, timeout=per_attempt_timeout)
+            except _httpx.TransportError as exc:
+                last_exc = exc
+                log.warning(
+                    "tool server /healthz transient error " "(attempt %d/%d): %s",
+                    attempt,
+                    max_attempts,
+                    exc,
+                )
+                continue
+
+            # Deterministic failures: surface immediately, no point retrying.
+            if resp.status_code == 503:
+                raise RuntimeError(
+                    f"Tool server at {url} is not ready (503). "
+                    "Start the server before launching training."
+                )
+            if resp.status_code >= 500:
+                raise RuntimeError(
+                    f"Tool server at {url} returned {resp.status_code}: {resp.text}"
+                )
+            log.info("Tool server health check passed: %s (attempt %d)", url, attempt)
+            return
+
+        raise RuntimeError(
+            f"Cannot reach tool server at {url} after {max_attempts} attempts: "
+            f"{last_exc}. Start the server before launching training."
+        ) from last_exc
+
+    async def _trigger_server_reload(self) -> bool:
+        """Ask the tool server to reload its FAISS index.
+
+        Returns True if the server successfully reloaded, False otherwise.
+        Uses a fresh HTTP client to avoid reusing a potentially broken connection.
+        """
+        url = f"{self.tool_server_url}/reload"
+        try:
+            async with httpx.AsyncClient(timeout=self.recovery_wait_s) as client:
+                resp = await client.post(url)
+                resp.raise_for_status()
+        except Exception as exc:
+            log.warning("tool server /reload failed: %s", exc)
+            return False
+        log.info("tool server reloaded successfully: %s", resp.text)
+        # Also replace the shared client so subsequent tool calls get a clean connection.
+        await self._http.aclose()
+        self._http = httpx.AsyncClient(timeout=self.tool_timeout_s)
+        return True
+
+    async def _record_tool_error(self, err: Exception) -> None:
+        """Track consecutive failures; on threshold, attempt recovery before raising."""
+        self._consecutive_tool_errors += 1
+        log.warning(
+            "tool_server error (%d consecutive): %s",
+            self._consecutive_tool_errors,
+            err,
+        )
+        if (
+            self.max_consecutive_tool_errors <= 0
+            or self._consecutive_tool_errors < self.max_consecutive_tool_errors
+        ):
+            return
+
+        recovered = await self._trigger_server_reload()
+        if recovered:
+            self._consecutive_tool_errors = 0
+            return
+
+        raise RuntimeError(
+            f"Tool server failed {self._consecutive_tool_errors} times in a row "
+            "and /reload did not succeed. "
+            "Aborting rollout worker to prevent silent reward degradation."
+        ) from err
+
+    def _record_tool_success(self) -> None:
+        self._consecutive_tool_errors = 0
 
     # ------------------------------------------------------------------ tool
 
     async def _call_tool(
         self, name: str, arguments: dict[str, Any]
     ) -> tuple[str, dict[str, Any]]:
-        if name != "local_search":
-            return json.dumps({"error": f"unknown tool: {name}"}), {"error": "unknown_tool"}
-        query = str(arguments.get("query", "")).strip()
+        _SEARCH_NAMES = {"local_search", "search"}
+
+        if name not in _SEARCH_NAMES and name != "grep":
+            return json.dumps({"error": f"unknown tool: {name}"}), {
+                "error": "unknown_tool"
+            }
+
         try:
             top_k = int(arguments.get("top_k", self.top_k_default))
         except (TypeError, ValueError):
             top_k = self.top_k_default
         top_k = max(1, min(top_k, self.top_k_max))
 
-        try:
-            r = await self._http.post(
-                f"{self.tool_server_url}/local_search",
-                json={"query": query, "top_k": top_k},
-            )
-            r.raise_for_status()
-            payload = r.json()
-        except Exception as e:  # pragma: no cover - net errors
-            log.warning("tool_server error: %s", e)
-            return json.dumps({"error": str(e), "results": []}), {"error": str(e)}
+        if name in _SEARCH_NAMES:
+            query = str(arguments.get("query", "")).strip()
+            try:
+                r = await self._http.post(
+                    f"{self.tool_server_url}/local_search",
+                    json={"query": query, "top_k": top_k},
+                )
+                r.raise_for_status()
+                payload = r.json()
+            except Exception as e:  # pragma: no cover - net errors
+                await self._record_tool_error(e)
+                return json.dumps({"error": str(e), "results": []}), {"error": str(e)}
 
-        results = payload.get("results", [])
-        rendered = render_search_results(results)
+            self._record_tool_success()
+            results = payload.get("results", [])
+            rendered = render_search_results(results)
+            summary: dict[str, Any] = {
+                "num_results": len(results),
+                "top_doc_ids": [r["doc_id"] for r in results],
+                "doc_ids_with_scores": [
+                    {"doc_id": r["doc_id"], "score": float(r["score"])} for r in results
+                ],
+            }
+
+        else:  # grep
+            pattern = str(arguments.get("pattern", "")).strip()
+            try:
+                r = await self._http.post(
+                    f"{self.tool_server_url}/grep",
+                    json={"pattern": pattern, "top_k": top_k},
+                )
+                r.raise_for_status()
+                payload = r.json()
+            except Exception as e:  # pragma: no cover - net errors
+                await self._record_tool_error(e)
+                return json.dumps({"error": str(e), "results": []}), {"error": str(e)}
+
+            self._record_tool_success()
+            results = payload.get("results", [])
+            total_matches: int = payload.get("total_matches", len(results))
+            rendered = render_grep_results(results, total_matches)
+            summary = {
+                "num_results": len(results),
+                "total_matches": total_matches,
+                "top_doc_ids": [r["doc_id"] for r in results],
+            }
+
         if len(rendered) > self.max_tool_response_length:
             if self.tool_response_truncate_side == "left":
                 rendered = rendered[: self.max_tool_response_length] + "...(truncated)"
@@ -257,13 +432,7 @@ class RetrievalReActAgentLoop(AgentLoopBase):
             else:
                 half = self.max_tool_response_length // 2
                 rendered = rendered[:half] + "...(truncated)..." + rendered[-half:]
-        summary = {
-            "num_results": len(results),
-            "top_doc_ids": [r["doc_id"] for r in results],
-            "doc_ids_with_scores": [
-                {"doc_id": r["doc_id"], "score": float(r["score"])} for r in results
-            ],
-        }
+
         return rendered, summary
 
     # ------------------------------------------------------------------- run
@@ -282,8 +451,18 @@ class RetrievalReActAgentLoop(AgentLoopBase):
         request_id = uuid.uuid4().hex
         metrics: dict[str, Any] = {}
 
+        prompt_version = str(extra_info.get("prompt_version", "v1"))
+        _tool_schemas = get_tool_schemas(prompt_version)
+        if self.tool_names:
+            filtered = [
+                s
+                for s in _tool_schemas
+                if s.get("function", {}).get("name") in self.tool_names
+            ]
+            if filtered:
+                _tool_schemas = filtered
         prompt_ids: list[int] = await self.apply_chat_template(
-            messages, tools=[LOCAL_SEARCH_TOOL_SCHEMA]
+            messages, tools=_tool_schemas
         )
         running_ids: list[int] = list(prompt_ids)
         response_mask: list[int] = []
@@ -383,7 +562,9 @@ class RetrievalReActAgentLoop(AgentLoopBase):
                 break
 
         response_mask = response_mask[: self.response_length]
-        response_ids = running_ids[len(prompt_ids) : len(prompt_ids) + len(response_mask)]
+        response_ids = running_ids[
+            len(prompt_ids) : len(prompt_ids) + len(response_mask)
+        ]
 
         agent_metrics = AgentLoopMetrics(
             generate_sequences=float(metrics.get("generate_sequences", 0.0)),

@@ -679,6 +679,10 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
                     metrics["filter_groups/n_filtered_all_zero"] = float(total_filtered_all_zero)
                     metrics["filter_groups/n_filtered_all_one"] = float(total_filtered_all_one)
 
+                if "response_len" in batch.non_tensor_batch:
+                    _rlen = np.asarray(batch.non_tensor_batch["response_len"], dtype=np.float32)
+                    metrics["response_length/q_99"] = float(np.percentile(_rlen, 99))
+
                 if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
                     self.train_dataloader.sampler.update(batch=batch)
 
