@@ -30,8 +30,8 @@ defaults:
   - _self_
 
 data:
-  train_files: data/processed/musique/grpo_train.parquet
-  val_files: data/processed/musique/grpo_val.parquet
+  train_files: data/processed/unioned/grpo_train.parquet
+  val_files: data/processed/unioned/grpo_val.parquet
   prompt_key: prompt
   reward_fn_key: data_source
   train_batch_size: 64
@@ -46,7 +46,7 @@ algorithm:
   adv_estimator: grpo                  # group-relative advantages (GSPO keeps these)
   norm_adv_by_std_in_grpo: true
   use_kl_in_reward: true
-  kl_coef: 0.003
+  kl_coef: 0.005
   gamma: 1.0
   lam: 1.0
   filter_groups:
@@ -88,7 +88,7 @@ actor_rollout_ref:
       lr_warmup_steps_ratio: 0.03
       min_lr: 1.0e-7                   # 10% of peak LR (Megatron expects absolute min_lr)
       clip_grad: 1.0
-      use_checkpoint_opt_param_scheduler: true   # restore num_steps from ckpt so warmup isn't replayed
+      use_checkpoint_opt_param_scheduler: false   # restore num_steps from ckpt so warmup isn't replayed
       override_optimizer_config:
         optimizer_offload_fraction: 1
         overlap_cpu_optimizer_d2h_h2d: true
@@ -140,17 +140,17 @@ actor_rollout_ref:
     top_p: 0.8
     top_k: -1
     do_sample: true
-    prompt_length: 4096   #  covers only the initial prompt_ids
-    response_length: 24576  # the response window. It contains all turns accumulated during the loop: assistant-generated tokens (mask=1) + tool-result tokens appended with mask=0
+    prompt_length: 1000   #  covers only the initial prompt_ids
+    response_length: 12000  # the response window. It contains all turns accumulated during the loop: assistant-generated tokens (mask=1) + tool-result tokens appended with mask=0
     gpu_memory_utilization: 0.50   # raised from 0.40: 35B-A3B TP=2 shard is ~35 GB → needs >43% budget just for weights
     max_num_seqs: 8                # reduced from 16 to keep KV cache footprint small at the higher utilisation
     tensor_model_parallel_size: 2      # vLLM TP
     enforce_eager: false
     free_cache_engine: true
-    max_model_len: 32768
+    max_model_len: 13000
     dtype: bfloat16
     # log_prob_use_dynamic_bsz: false
-    log_prob_micro_batch_size_per_gpu: 1
+    log_prob_micro_batch_size_per_gpu: 2
     # log_prob_max_token_len_per_gpu: 20480   # match actor budget to keep entropy logits in memory
     checkpoint_engine:
       update_weights_bucket_megabytes: 4096
@@ -165,12 +165,12 @@ actor_rollout_ref:
       max_tool_response_length: 4096
     val_kwargs:
       n: 1
-      temperature: 1.0
+      temperature: 0.1
       top_p: 0.8
 
   ref:
     log_prob_use_dynamic_bsz: false
-    log_prob_micro_batch_size_per_gpu: 1
+    log_prob_micro_batch_size_per_gpu: 2
     # log_prob_max_token_len_per_gpu: 20480   # ref also needs the smaller budget
     megatron:
       # See note in actor.megatron above: TP must be <= num_key_value_heads (=2).
@@ -189,9 +189,9 @@ reward:
       # r = alpha * NDCG@k + (1 - alpha) * F_beta(output)
       #   - length_penalty + format_penalty
       #   + answer_bonus * [stopped_reason == "answer"]
-      ndcg_k: 10
-      alpha: 0.7
-      f_beta: 2.0
+      ndcg_k: 5
+      alpha: 1.0
+      f_beta: 4.0
       length_alpha: 0.0              # length penalty is OPTIONAL; set >0 to enable
       length_target_tokens: 8192
       parse_error_penalty: 0.0
@@ -199,13 +199,21 @@ reward:
 
 agent_loop:
   retrieval_react:
+    tool_names: "local_search"
     tool_server_url: http://localhost:8100
     tool_timeout_s: 30
     max_turns: 8
     max_tool_calls: 8
-    top_k_default: 10
+    top_k_default: 5
     top_k_max: 50
     max_response_tokens: 4096
+    # Abort the rollout worker after this many consecutive tool-server failures
+    # instead of silently returning empty results and degrading rewards.
+    # Set to 0 to disable (old behaviour).
+    # Sized for ~128 agent workers: a single brownout (e.g. weight update
+    # spike) can produce a short burst of timeouts across many workers at
+    # once. Pair with the singleflight /reload on the server (tool_server/main.py).
+    max_consecutive_tool_errors: 20
 
 trainer:
   project_name: agentic_retrieval_gspo
@@ -216,12 +224,18 @@ trainer:
   n_gpus_per_node: 8
   save_freq: 10
   max_actor_ckpt_to_keep: 1
-  test_freq: 2
+  test_freq: 5
   logger: ['console', 'wandb']
   default_local_dir: checkpoints/gspo_qwen3_moe/
   val_before_train: true
   balance_batch: true
   critic_warmup: 0
+
+index:
+  grep_max_concurrency: 4     # default 4; lower → less GIL pressure on search
+  grep_timeout_s: 15.0         # default 10.0
+  grep_max_text_chars: 4096   
+  reload_cooldown_s: 30.0     
 
 ti_to_check:
   every_n_steps: 50

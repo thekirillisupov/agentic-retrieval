@@ -16,6 +16,8 @@ from agent.parser import parse_answer
 from agent.prompts import (
     LOCAL_SEARCH_TOOL_SCHEMA,
     get_prompt,
+    get_tool_schemas,
+    render_grep_results,
     render_search_results,
 )
 from agent.schemas import (
@@ -51,6 +53,14 @@ class ToolServerClient:
         r.raise_for_status()
         return r.json()
 
+    def grep(self, pattern: str, top_k: int) -> dict[str, Any]:
+        r = self.client.post(
+            f"{self.url}/grep",
+            json={"pattern": pattern, "top_k": top_k},
+        )
+        r.raise_for_status()
+        return r.json()
+
     def close(self) -> None:
         self.client.close()
 
@@ -78,7 +88,9 @@ class AgentHarness:
         self.top_k_default = top_k_default
         self.top_k_max = top_k_max
 
-    def run(self, agent_input: AgentInput, *, gold_doc_ids: list[str] | None = None) -> AgentOutput:
+    def run(
+        self, agent_input: AgentInput, *, gold_doc_ids: list[str] | None = None
+    ) -> AgentOutput:
         system_prompt = get_prompt(self.prompt_version)
 
         # The harness owns the system message; caller passes only the conversation.
@@ -99,7 +111,7 @@ class AgentHarness:
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[m.to_openai() for m in messages],
-                tools=[LOCAL_SEARCH_TOOL_SCHEMA],
+                tools=get_tool_schemas(self.prompt_version),
                 tool_choice="auto",
                 max_tokens=self.max_tokens,
                 temperature=self.temperature,
@@ -217,7 +229,9 @@ class AgentHarness:
         except json.JSONDecodeError:
             args = {}
 
-        if name != "local_search":
+        _SEARCH_NAMES = {"local_search", "search"}
+
+        if name not in _SEARCH_NAMES and name != "grep":
             content = json.dumps({"error": f"unknown tool: {name}"})
             return (
                 Message(role="tool", tool_call_id=tc.id, content=content),
@@ -230,56 +244,102 @@ class AgentHarness:
                 ),
             )
 
-        query = str(args.get("query", "")).strip()
-        top_k = int(args.get("top_k", top_k_default))
-        top_k = max(1, min(top_k, self.top_k_max))
-
         t0 = time.perf_counter()
-        try:
-            response = self.tool_client.local_search(query=query, top_k=top_k)
-        except Exception as e:
-            latency_ms = int((time.perf_counter() - t0) * 1000)
-            log.exception("tool server error")
-            err_content = json.dumps({"error": str(e), "results": []})
-            return (
-                Message(role="tool", tool_call_id=tc.id, content=err_content),
-                ToolCallTrace(
-                    turn=turn,
-                    tool=name,
-                    arguments=args,
-                    result_summary={"error": str(e)},
-                    latency_ms=latency_ms,
-                ),
-            )
-        latency_ms = int((time.perf_counter() - t0) * 1000)
 
-        results: list[dict[str, Any]] = response.get("results", [])
-
-        # Update seen-passages accumulator.
-        for r in results:
-            doc_id = r["doc_id"]
-            score = float(r["score"])
-            if doc_id in seen:
-                seen[doc_id].update(score)
-            else:
-                seen[doc_id] = SeenPassage(
-                    doc_id=doc_id,
-                    title=r["title"],
-                    text=r["text"],
-                    best_score=score,
-                    first_seen_turn=turn,
+        if name in _SEARCH_NAMES:
+            query = str(args.get("query", "")).strip()
+            top_k = int(args.get("top_k", top_k_default))
+            top_k = max(1, min(top_k, self.top_k_max))
+            # Over-fetch so that after deduplication we still return ~top_k new docs.
+            fetch_k = min(top_k + len(seen), self.top_k_max)
+            try:
+                response = self.tool_client.local_search(query=query, top_k=fetch_k)
+            except Exception as e:
+                latency_ms = int((time.perf_counter() - t0) * 1000)
+                log.exception("tool server error")
+                err_content = json.dumps({"error": str(e), "results": []})
+                return (
+                    Message(role="tool", tool_call_id=tc.id, content=err_content),
+                    ToolCallTrace(
+                        turn=turn,
+                        tool=name,
+                        arguments=args,
+                        result_summary={"error": str(e)},
+                        latency_ms=latency_ms,
+                    ),
                 )
+            latency_ms = int((time.perf_counter() - t0) * 1000)
+            results: list[dict[str, Any]] = response.get("results", [])
+            new_results: list[dict[str, Any]] = []
+            for r in results:
+                doc_id = r["doc_id"]
+                score = float(r["score"])
+                if doc_id in seen:
+                    seen[doc_id].update(score)
+                else:
+                    seen[doc_id] = SeenPassage(
+                        doc_id=doc_id,
+                        title=r["title"],
+                        text=r["text"],
+                        best_score=score,
+                        first_seen_turn=turn,
+                    )
+                    new_results.append(r)
+            visible_results = new_results[:top_k]
+            rendered = render_search_results(visible_results)
+            summary: dict[str, Any] = {
+                "num_results": len(visible_results),
+                "num_deduped": len(results) - len(new_results),
+                "top_doc_ids": [r["doc_id"] for r in visible_results],
+            }
 
-        rendered = render_search_results(results)
+        else:  # grep
+            pattern = str(args.get("pattern", "")).strip()
+            top_k = int(args.get("top_k", top_k_default))
+            top_k = max(1, min(top_k, self.top_k_max))
+            try:
+                response = self.tool_client.grep(pattern=pattern, top_k=top_k)
+            except Exception as e:
+                latency_ms = int((time.perf_counter() - t0) * 1000)
+                log.exception("tool server error (grep)")
+                err_content = json.dumps({"error": str(e), "results": []})
+                return (
+                    Message(role="tool", tool_call_id=tc.id, content=err_content),
+                    ToolCallTrace(
+                        turn=turn,
+                        tool=name,
+                        arguments=args,
+                        result_summary={"error": str(e)},
+                        latency_ms=latency_ms,
+                    ),
+                )
+            latency_ms = int((time.perf_counter() - t0) * 1000)
+            results = response.get("results", [])
+            total_matches: int = response.get("total_matches", len(results))
+            # Grep hits have no score; use 1.0 as a sentinel for exact matches.
+            for r in results:
+                doc_id = r["doc_id"]
+                if doc_id not in seen:
+                    seen[doc_id] = SeenPassage(
+                        doc_id=doc_id,
+                        title=r["title"],
+                        text=r["text"],
+                        best_score=1.0,
+                        first_seen_turn=turn,
+                    )
+            rendered = render_grep_results(results, total_matches)
+            summary = {
+                "num_results": len(results),
+                "total_matches": total_matches,
+                "top_doc_ids": [r["doc_id"] for r in results],
+            }
+
         tool_msg = Message(role="tool", tool_call_id=tc.id, content=rendered)
         trace = ToolCallTrace(
             turn=turn,
             tool=name,
             arguments=args,
-            result_summary={
-                "num_results": len(results),
-                "top_doc_ids": [r["doc_id"] for r in results],
-            },
+            result_summary=summary,
             latency_ms=latency_ms,
         )
         return tool_msg, trace

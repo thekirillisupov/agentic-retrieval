@@ -1,9 +1,11 @@
+# Unioned SBOL + MuSiQue: merged FAISS index and GRPO parquet under data/processed/unioned/.
+# Tool server: CONFIG=configs/unioned.yaml bash scripts/serve_tool.sh
 model:
   name: Qwen/Qwen3.5-35B-A3B
   vllm_url: http://localhost:8000/v1
   api_key: EMPTY
-  max_tokens: 12000
-  temperature: 0.1
+  max_tokens: 4096
+  temperature: 0.6
 
 tool_server:
   url: http://localhost:8100
@@ -22,7 +24,7 @@ embedder:
   pooling: "cls"
 
 index:
-  dir: ./indexes/musique/
+  dir: ./indexes/unioned/
   top_k_default: 10
   top_k_max: 50
   use_gpu: false
@@ -35,12 +37,8 @@ agent:
   prompt_version: v1_edit
 
 eval:
-  raw_musique_dir: ./data/raw/musique/
-  processed_dir: ./data/processed/musique/
-  eval_dataset_path: ./data/processed/musique/musique_dev_eval.jsonl
-  subset_size: 200
-  budget_sweep: [1, 3, 5, 8]
-  ndcg_k: 10
+  processed_dir: ./data/processed/unioned/
+  eval_dataset_path: ./data/processed/unioned/grpo_val.parquet
 
 trajectories:
   output_dir: ./trajectories_data/

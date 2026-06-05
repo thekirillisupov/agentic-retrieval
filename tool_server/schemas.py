@@ -36,6 +36,23 @@ class LookupByIdResponse(BaseModel):
     docs: list[Doc]
 
 
+class GrepRequest(BaseModel):
+    pattern: str = Field(..., description="Literal string or regex pattern to search for (case-insensitive)")
+    top_k: int = Field(default=8, ge=1, le=200)
+
+
+class GrepHit(BaseModel):
+    doc_id: str
+    title: str
+    text: str
+
+
+class GrepResponse(BaseModel):
+    results: list[GrepHit]
+    latency_ms: int
+    total_matches: int
+
+
 class StatsResponse(BaseModel):
     num_docs: int
     embedder: str

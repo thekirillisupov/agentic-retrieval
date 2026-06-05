@@ -35,16 +35,21 @@ from agent.prompts import get_prompt
 log = logging.getLogger(__name__)
 
 
-DATA_SOURCE = "musique_retrieval"
+DEFAULT_DATA_SOURCE = "musique_retrieval"
 ABILITY = "agentic_retrieval"
 AGENT_NAME = "retrieval_react"
 
 
-def _row(record: dict[str, Any], prompt_version: str) -> dict[str, Any]:
+def _row(
+    record: dict[str, Any],
+    prompt_version: str,
+    *,
+    data_source: str = DEFAULT_DATA_SOURCE,
+) -> dict[str, Any]:
     system_prompt = get_prompt(prompt_version)
     gold = list(record["gold_doc_ids"])
     return {
-        "data_source": DATA_SOURCE,
+        "data_source": data_source,
         "ability": ABILITY,
         "agent_name": AGENT_NAME,
         "prompt": [
@@ -70,7 +75,9 @@ def build(
     out_val: Path | None,
     *,
     prompt_version: str = "v1",
+    data_source: str = DEFAULT_DATA_SOURCE,
     val_size: int = 200,
+    val_frac: float | None = None,
     seed: int = 0,
     limit: int | None = None,
 ) -> tuple[int, int]:
@@ -80,12 +87,17 @@ def build(
             line = line.strip()
             if not line:
                 continue
-            rows.append(_row(json.loads(line), prompt_version))
+            rows.append(_row(json.loads(line), prompt_version, data_source=data_source))
             if limit is not None and len(rows) >= limit:
                 break
 
     rng = random.Random(seed)
     rng.shuffle(rows)
+
+    if val_frac is not None:
+        if not 0.0 < val_frac < 1.0:
+            raise ValueError(f"val_frac must be in (0, 1), got {val_frac}")
+        val_size = max(1, round(len(rows) * val_frac))
 
     if out_val is not None and val_size > 0:
         val = rows[:val_size]
@@ -114,7 +126,14 @@ def main() -> None:
     parser.add_argument("--out-train", default="data/processed/musique/grpo_train.parquet")
     parser.add_argument("--out-val", default="data/processed/musique/grpo_val.parquet")
     parser.add_argument("--prompt-version", default="v1")
+    parser.add_argument("--data-source", default=DEFAULT_DATA_SOURCE)
     parser.add_argument("--val-size", type=int, default=200)
+    parser.add_argument(
+        "--val-frac",
+        type=float,
+        default=None,
+        help="If set, overrides --val-size with round(n * val_frac) validation rows.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--limit", type=int, default=None)
     args = parser.parse_args()
@@ -124,7 +143,9 @@ def main() -> None:
         Path(args.out_train),
         Path(args.out_val) if args.out_val else None,
         prompt_version=args.prompt_version,
+        data_source=args.data_source,
         val_size=args.val_size,
+        val_frac=args.val_frac,
         seed=args.seed,
         limit=args.limit,
     )
