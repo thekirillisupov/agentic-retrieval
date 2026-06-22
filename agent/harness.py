@@ -14,11 +14,12 @@ from openai import OpenAI
 
 from agent.parser import parse_answer
 from agent.prompts import (
-    LOCAL_SEARCH_TOOL_SCHEMA,
+    format_user_content,
     get_prompt,
     get_tool_schemas,
     render_grep_results,
-    render_search_results,
+    render_neighbours_results,
+    render_search_results_json,
 )
 from agent.schemas import (
     AgentInput,
@@ -45,19 +46,33 @@ class ToolServerClient:
         self.url = url.rstrip("/")
         self.client = httpx.Client(timeout=timeout_s)
 
-    def local_search(self, query: str, top_k: int) -> dict[str, Any]:
-        r = self.client.post(
-            f"{self.url}/local_search",
-            json={"query": query, "top_k": top_k},
-        )
+    def local_search(
+        self, query: str, top_k: int, source: str | None = None
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"query": query, "top_k": top_k}
+        if source:
+            payload["source"] = source
+        r = self.client.post(f"{self.url}/local_search", json=payload)
         r.raise_for_status()
         return r.json()
 
-    def grep(self, pattern: str, top_k: int) -> dict[str, Any]:
-        r = self.client.post(
-            f"{self.url}/grep",
-            json={"pattern": pattern, "top_k": top_k},
-        )
+    def grep(
+        self, pattern: str, top_k: int, source: str | None = None
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"pattern": pattern, "top_k": top_k}
+        if source:
+            payload["source"] = source
+        r = self.client.post(f"{self.url}/grep", json=payload)
+        r.raise_for_status()
+        return r.json()
+
+    def get_neighbours(
+        self, doc_id: str, window: int, source: str | None = None
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"doc_id": doc_id, "window": window}
+        if source:
+            payload["source"] = source
+        r = self.client.post(f"{self.url}/get_neighbours", json=payload)
         r.raise_for_status()
         return r.json()
 
@@ -89,13 +104,30 @@ class AgentHarness:
         self.top_k_max = top_k_max
 
     def run(
-        self, agent_input: AgentInput, *, gold_doc_ids: list[str] | None = None
+        self,
+        agent_input: AgentInput,
+        *,
+        gold_doc_ids: list[str] | None = None,
+        prompt_version: str | None = None,
     ) -> AgentOutput:
-        system_prompt = get_prompt(self.prompt_version)
+        pv = prompt_version or self.prompt_version
+        system_prompt = get_prompt(pv)
 
         # The harness owns the system message; caller passes only the conversation.
+        # Apply prompt-version-specific user content formatting (e.g. <client> wrap).
         messages: list[Message] = [Message(role="system", content=system_prompt)]
-        messages.extend(agent_input.messages)
+        for msg in agent_input.messages:
+            if msg.role == "user":
+                messages.append(
+                    Message(
+                        role="user",
+                        content=format_user_content(
+                            str(msg.content or ""), pv
+                        ),
+                    )
+                )
+            else:
+                messages.append(msg)
 
         seen: dict[str, SeenPassage] = {}
         tool_call_traces: list[ToolCallTrace] = []
@@ -111,7 +143,7 @@ class AgentHarness:
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[m.to_openai() for m in messages],
-                tools=get_tool_schemas(self.prompt_version),
+                tools=get_tool_schemas(pv),
                 tool_choice="auto",
                 max_tokens=self.max_tokens,
                 temperature=self.temperature,
@@ -153,7 +185,11 @@ class AgentHarness:
                         budget_exhausted = True
                         break
                     tool_msg, trace = self._execute_tool_call(
-                        tc, turn, seen, agent_input.top_k_default
+                        tc,
+                        turn,
+                        seen,
+                        agent_input.top_k_default,
+                        agent_input.source,
                     )
                     messages.append(tool_msg)
                     tool_call_traces.append(trace)
@@ -193,7 +229,7 @@ class AgentHarness:
             trajectory_id=str(uuid.uuid4()),
             timestamp=datetime.datetime.now(datetime.timezone.utc).isoformat(),
             model=self.model,
-            prompt_version=self.prompt_version,
+            prompt_version=pv,
             input_messages=list(agent_input.messages),
             max_turns=agent_input.max_turns,
             max_tool_calls=agent_input.max_tool_calls,
@@ -222,6 +258,7 @@ class AgentHarness:
         turn: int,
         seen: dict[str, SeenPassage],
         top_k_default: int,
+        pinned_source: str | None = None,
     ) -> tuple[Message, ToolCallTrace]:
         name = tc.function.name
         try:
@@ -229,9 +266,12 @@ class AgentHarness:
         except json.JSONDecodeError:
             args = {}
 
+        # A `source` emitted by the model overrides the per-row pinned source.
+        source = str(args.get("source") or "").strip() or pinned_source
+
         _SEARCH_NAMES = {"local_search", "search"}
 
-        if name not in _SEARCH_NAMES and name != "grep":
+        if name not in _SEARCH_NAMES and name not in ("grep", "get_neighbours"):
             content = json.dumps({"error": f"unknown tool: {name}"})
             return (
                 Message(role="tool", tool_call_id=tc.id, content=content),
@@ -253,7 +293,9 @@ class AgentHarness:
             # Over-fetch so that after deduplication we still return ~top_k new docs.
             fetch_k = min(top_k + len(seen), self.top_k_max)
             try:
-                response = self.tool_client.local_search(query=query, top_k=fetch_k)
+                response = self.tool_client.local_search(
+                    query=query, top_k=fetch_k, source=source
+                )
             except Exception as e:
                 latency_ms = int((time.perf_counter() - t0) * 1000)
                 log.exception("tool server error")
@@ -270,12 +312,21 @@ class AgentHarness:
                 )
             latency_ms = int((time.perf_counter() - t0) * 1000)
             results: list[dict[str, Any]] = response.get("results", [])
-            new_results: list[dict[str, Any]] = []
+            # Render the ranked hits in order, preserving the position of every
+            # passage but optimising context: NEW docs are shown as full
+            # passages, already-seen docs as id-only placeholders
+            # ({"doc_id": ..., "seen": true}). We over-fetched above; walk in
+            # rank order until top_k NEW docs have been shown, then stop (any
+            # trailing seen ids below the last new doc are dropped). Already-seen
+            # docs still get their score metadata refreshed.
+            display: list[dict[str, Any]] = []
+            new_doc_ids: list[str] = []
             for r in results:
                 doc_id = r["doc_id"]
                 score = float(r["score"])
                 if doc_id in seen:
                     seen[doc_id].update(score)
+                    display.append({"doc_id": doc_id})
                 else:
                     seen[doc_id] = SeenPassage(
                         doc_id=doc_id,
@@ -284,21 +335,26 @@ class AgentHarness:
                         best_score=score,
                         first_seen_turn=turn,
                     )
-                    new_results.append(r)
-            visible_results = new_results[:top_k]
-            rendered = render_search_results(visible_results)
+                    display.append(r)
+                    new_doc_ids.append(doc_id)
+                    if len(new_doc_ids) >= top_k:
+                        break
+            rendered = render_search_results_json(display)
             summary: dict[str, Any] = {
-                "num_results": len(visible_results),
-                "num_deduped": len(results) - len(new_results),
-                "top_doc_ids": [r["doc_id"] for r in visible_results],
+                "num_results": len(display),
+                "num_new": len(new_doc_ids),
+                "num_seen_refs": len(display) - len(new_doc_ids),
+                "top_doc_ids": new_doc_ids,
             }
 
-        else:  # grep
+        elif name == "grep":
             pattern = str(args.get("pattern", "")).strip()
             top_k = int(args.get("top_k", top_k_default))
             top_k = max(1, min(top_k, self.top_k_max))
             try:
-                response = self.tool_client.grep(pattern=pattern, top_k=top_k)
+                response = self.tool_client.grep(
+                    pattern=pattern, top_k=top_k, source=source
+                )
             except Exception as e:
                 latency_ms = int((time.perf_counter() - t0) * 1000)
                 log.exception("tool server error (grep)")
@@ -331,6 +387,52 @@ class AgentHarness:
             summary = {
                 "num_results": len(results),
                 "total_matches": total_matches,
+                "top_doc_ids": [r["doc_id"] for r in results],
+            }
+
+        else:  # get_neighbours
+            doc_id_arg = str(args.get("doc_id", "")).strip()
+            window = int(args.get("window", 1))
+            window = max(1, min(window, 10))
+            try:
+                response = self.tool_client.get_neighbours(
+                    doc_id=doc_id_arg, window=window, source=source
+                )
+            except Exception as e:
+                latency_ms = int((time.perf_counter() - t0) * 1000)
+                log.exception("tool server error (get_neighbours)")
+                err_content = json.dumps({"error": str(e), "results": []})
+                return (
+                    Message(role="tool", tool_call_id=tc.id, content=err_content),
+                    ToolCallTrace(
+                        turn=turn,
+                        tool=name,
+                        arguments=args,
+                        result_summary={"error": str(e)},
+                        latency_ms=latency_ms,
+                    ),
+                )
+            latency_ms = int((time.perf_counter() - t0) * 1000)
+            results = response.get("results", [])
+            status = str(response.get("status", "ok"))
+            # Neighbours are structural (no relevance score). Register so the
+            # model may cite them; use 0.0 since there is no semantic score.
+            for r in results:
+                doc_id = r["doc_id"]
+                if doc_id not in seen:
+                    seen[doc_id] = SeenPassage(
+                        doc_id=doc_id,
+                        title=r["title"],
+                        text=r["text"],
+                        best_score=0.0,
+                        first_seen_turn=turn,
+                    )
+            rendered = render_neighbours_results(
+                results, status, doc_id_arg, window
+            )
+            summary = {
+                "num_results": len(results),
+                "status": status,
                 "top_doc_ids": [r["doc_id"] for r in results],
             }
 

@@ -29,7 +29,15 @@ def load_corpus(path: Path) -> list[DocMeta]:
     with path.open("r", encoding="utf-8") as f:
         for line in f:
             d = json.loads(line)
-            rows.append(DocMeta(d["doc_id"], d["title"], d["text"]))
+            rows.append(
+                DocMeta(
+                    d["doc_id"],
+                    d["title"],
+                    d["text"],
+                    d.get("file_name"),
+                    d.get("index"),
+                )
+            )
     return rows
 
 

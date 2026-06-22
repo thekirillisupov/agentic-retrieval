@@ -29,7 +29,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from agent.prompts import LOCAL_SEARCH_TOOL_SCHEMA
+from agent.prompts import get_tool_schemas
 
 log = logging.getLogger(__name__)
 
@@ -77,20 +77,33 @@ def check_consistency(
     response_ids: list[int],
     response_mask: list[int] | None = None,
     tools: list[dict[str, Any]] | None = None,
+    prompt_version: str = "v1_edit",
 ) -> dict[str, Any]:
     """Re-tokenise messages_full and compare against prompt_ids+response_ids.
 
+    IMPORTANT — thinking models (Qwen3.5):
+    A naive full-sequence re-render of ``messages_full`` does NOT reconstruct the
+    rollout token ids, because the chat template rewrites reasoning sections: it
+    injects an empty ``</think>\\n\\n`` block when an assistant turn has no
+    ``<think>`` content, and shifts the ``<think>`` token across the prompt/response
+    boundary when it does. The training path is unaffected by this — ``agent_loop``
+    accumulates the *actual* sampled token ids in ``running_ids`` and never
+    re-renders — so ``response_ids`` fed to the optimiser are exact. The only
+    invariant this check can robustly assert is ``mask_consistent``; the re-render
+    diff is reported as informational, not as a hard failure.
+
     Returns a report dict with::
 
-        ok                    bool
+        ok                    bool         mask_consistent (primary safety signal)
+        mask_consistent       bool         mask length == response_ids length
+        full_render_match     bool         re-render reproduces prompt+response exactly
+                                           (expected False for Qwen3.5 thinking output)
         prompt_match          bool         prompt prefix is identical
-        suffix_match          bool         response suffix is identical
         first_diff_index      int | None   index of first mismatch (or None)
         rendered_len          int          len(re-tokenised)
         recorded_len          int          len(prompt_ids+response_ids)
-        mask_consistent       bool         mask length == response_ids length
     """
-    tools = tools if tools is not None else [LOCAL_SEARCH_TOOL_SCHEMA]
+    tools = tools if tools is not None else get_tool_schemas(prompt_version)
     cleaned = [
         {k: v for k, v in m.items() if not k.startswith("_")}
         for m in messages_full
@@ -115,24 +128,27 @@ def check_consistency(
 
     prompt_len = len(prompt_ids)
     prompt_match = rendered[:prompt_len] == recorded[:prompt_len]
-    suffix_match = (
-        len(rendered) >= prompt_len
-        and rendered[prompt_len:] == recorded[prompt_len:]
-    )
+    full_render_match = first_diff is None and len(rendered) == len(recorded)
 
     mask_consistent = response_mask is None or len(response_mask) == len(response_ids)
 
     report = {
-        "ok": first_diff is None and mask_consistent,
+        "ok": mask_consistent,
+        "mask_consistent": mask_consistent,
+        "full_render_match": full_render_match,
         "prompt_match": prompt_match,
-        "suffix_match": suffix_match,
         "first_diff_index": first_diff,
         "rendered_len": len(rendered),
         "recorded_len": len(recorded),
-        "mask_consistent": mask_consistent,
     }
-    if not report["ok"]:
-        log.warning("TI/TO mismatch: %s", report)
+    if not mask_consistent:
+        log.warning("TI/TO mask inconsistency: %s", report)
+    elif not full_render_match:
+        log.debug(
+            "TI/TO re-render diff at index %s (expected for Qwen3.5 thinking; "
+            "training uses accumulated ids, not this re-render)",
+            first_diff,
+        )
     return report
 
 
@@ -147,12 +163,14 @@ def main() -> None:
 
     tok = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
     blob = json.loads(Path(args.traj).read_text())
+    prompt_version = blob.get("prompt_version", "v1_edit")
     rep = check_consistency(
         tokenizer=tok,
         messages_full=blob["messages_full"],
         prompt_ids=blob["prompt_ids"],
         response_ids=blob["response_ids"],
         response_mask=blob.get("response_mask"),
+        prompt_version=prompt_version,
     )
     print(json.dumps(rep, indent=2))
 

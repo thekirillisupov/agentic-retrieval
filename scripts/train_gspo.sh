@@ -13,7 +13,8 @@
 #   * verl installed with Megatron-LM support (see verl docs; the FSDP-only
 #     install used by scripts/train_grpo.sh is NOT enough).
 #   * scripts/build_grpo_data.sh has been run -> grpo_{train,val}.parquet.
-#   * Tool server is up:  bash scripts/serve_tool.sh
+#   * Union index built: bash scripts/build_union_index.sh
+#   * Tool server is up:  CONFIG=configs/unioned.yaml bash scripts/serve_tool.sh
 #
 # Override individual fields with KEY=VALUE extra args, e.g.:
 #   bash scripts/train_gspo.sh actor_rollout_ref.rollout.n=16

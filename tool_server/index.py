@@ -45,6 +45,12 @@ class DocMeta:
     doc_id: str
     title: str
     text: str
+    # Adjacency metadata for sliced chunks. Both are None for "independent"
+    # chunks and for legacy indexes built before chunk slicing existed. When
+    # set, ``file_name`` is the source document a chunk was cut from and
+    # ``index`` is its 0-based position within that document.
+    file_name: str | None = None
+    index: int | None = None
 
 
 def build_index(dim: int, *, use_gpu: bool = False, gpu_id: int = 3) -> faiss.Index:
@@ -76,13 +82,14 @@ def save_index(
 
     with (out_dir / METADATA_FILENAME).open("w", encoding="utf-8") as f:
         for m in metadata:
-            f.write(
-                json.dumps(
-                    {"doc_id": m.doc_id, "title": m.title, "text": m.text},
-                    ensure_ascii=False,
-                )
-                + "\n"
-            )
+            rec: dict[str, Any] = {"doc_id": m.doc_id, "title": m.title, "text": m.text}
+            # Only emit adjacency fields when present, so legacy corpora keep the
+            # exact same metadata.jsonl shape as before.
+            if m.file_name is not None:
+                rec["file_name"] = m.file_name
+            if m.index is not None:
+                rec["index"] = m.index
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     config = {
         "embedder": embedder_name,
@@ -110,6 +117,17 @@ class FaissIndex:
         self.doc_id_to_pos: dict[str, int] = {
             m.doc_id: i for i, m in enumerate(metadata)
         }
+        # Adjacency map for get_neighbours: file_name -> [(index, pos), ...]
+        # sorted by index. Only built from chunks that carry both file_name and
+        # index, so legacy corpora produce an empty map (-> supports_neighbours
+        # is False) and get_neighbours degrades to a no-op.
+        self._file_to_chunks: dict[str, list[tuple[int, int]]] = {}
+        for pos, m in enumerate(metadata):
+            if m.file_name is not None and m.index is not None:
+                self._file_to_chunks.setdefault(m.file_name, []).append((m.index, pos))
+        for chunks in self._file_to_chunks.values():
+            chunks.sort()
+        self.supports_neighbours: bool = bool(self._file_to_chunks)
         # Precomputed casefolded title/text used by the literal-pattern fast
         # path in ``grep``. Casefolding once at load time (a few hundred ms on
         # the unioned corpus) avoids re-folding ~50 MB of text on every grep
@@ -154,7 +172,15 @@ class FaissIndex:
         with (dir_path / METADATA_FILENAME).open("r", encoding="utf-8") as f:
             for line in f:
                 d = json.loads(line)
-                metadata.append(DocMeta(d["doc_id"], d["title"], d["text"]))
+                metadata.append(
+                    DocMeta(
+                        d["doc_id"],
+                        d["title"],
+                        d["text"],
+                        d.get("file_name"),
+                        d.get("index"),
+                    )
+                )
 
         if len(metadata) != index.ntotal:
             raise RuntimeError(
@@ -180,6 +206,42 @@ class FaissIndex:
         if pos is None:
             return None
         return self.metadata[pos]
+
+    def get_neighbours(
+        self, doc_id: str, window: int = 1
+    ) -> tuple[list[DocMeta], str]:
+        """Return chunks adjacent to ``doc_id`` within +/-``window`` of its index.
+
+        The status string tells the caller *why* there are no neighbours so the
+        rendered tool message can be honest with the model:
+
+          * ``"unknown_doc"``       -- doc_id not in this corpus.
+          * ``"no_metadata"``       -- corpus carries no adjacency info at all
+                                       (e.g. a legacy index built before chunk
+                                       slicing). get_neighbours is a no-op here.
+          * ``"independent_chunk"`` -- corpus supports adjacency but this doc is
+                                       an independent chunk (no file_name/index).
+          * ``"ok"``                -- results hold the neighbours (possibly
+                                       empty if none fall inside the window).
+
+        The anchor chunk itself is excluded; results are ordered by index.
+        """
+        pos = self.doc_id_to_pos.get(doc_id)
+        if pos is None:
+            return [], "unknown_doc"
+        if not self.supports_neighbours:
+            return [], "no_metadata"
+        anchor = self.metadata[pos]
+        if anchor.file_name is None or anchor.index is None:
+            return [], "independent_chunk"
+        window = max(0, window)
+        lo, hi = anchor.index - window, anchor.index + window
+        neighbours = [
+            self.metadata[p]
+            for idx, p in self._file_to_chunks.get(anchor.file_name, [])
+            if lo <= idx <= hi and idx != anchor.index
+        ]
+        return neighbours, "ok"
 
     def grep(
         self,

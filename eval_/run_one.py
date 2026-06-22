@@ -18,6 +18,7 @@ import yaml
 
 from agent.harness import AgentHarness, ToolServerClient
 from agent.parser import parse_answer
+from agent.prompts import format_user_content
 from agent.schemas import AgentInput, Message
 from eval_.baseline import load_eval
 from eval_.metrics import evaluate_one
@@ -189,8 +190,11 @@ def retrieve_only(
         cfg["tool_server"]["url"],
         timeout_s=cfg["tool_server"].get("timeout_s", 30),
     )
+    source = example.get("source") or cfg["index"].get("default_source")
     try:
-        response = tool.local_search(query=example["question"], top_k=top_k)
+        response = tool.local_search(
+            query=example["question"], top_k=top_k, source=source
+        )
     finally:
         tool.close()
 
@@ -318,6 +322,7 @@ def run_one(
             max_turns=cfg["agent"]["max_turns"],
             max_tool_calls=max_tool_calls or cfg["agent"]["max_tool_calls"],
             top_k_default=cfg["index"].get("top_k_default", 10),
+            source=example.get("source") or cfg["index"].get("default_source"),
         )
         output = harness.run(agent_input, gold_doc_ids=gold or None)
     finally:
@@ -406,6 +411,11 @@ def main() -> None:
         default=None,
         help="Number of passages to retrieve (default: index.top_k_default from config)",
     )
+    parser.add_argument(
+        "--wrap-client",
+        action="store_true",
+        help="Wrap question as <client>...</client> (v2_search_only conversation format)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -424,6 +434,11 @@ def main() -> None:
         index=args.index,
         eval_path=eval_path,
     )
+    if args.wrap_client:
+        example = {
+            **example,
+            "question": format_user_content(example["question"], "v2_search_only"),
+        }
     if gold_override is not None:
         example = {**example, "gold_doc_ids": gold_override}
 

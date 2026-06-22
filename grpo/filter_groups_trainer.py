@@ -75,7 +75,9 @@ Implementation notes:
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -100,6 +102,7 @@ from verl.trainer.ppo.ray_trainer import (
     compute_advantage,
     compute_response_mask,
 )
+from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.trainer.ppo.reward import extract_reward
 from verl.utils.checkpoint.checkpoint_manager import should_save_ckpt_esi
 from verl.utils.debug import marked_timer
@@ -107,6 +110,8 @@ from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
 from verl.trainer.ppo.utils import Role
+
+from grpo.tool_penalty import compute_anchored_tool_penalty
 
 log = logging.getLogger(__name__)
 
@@ -153,6 +158,94 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
     absent) the fit loop behaves identically to upstream v0.7.1
     ``RayPPOTrainer.fit``.
     """
+
+    def _apply_count_penalty(
+        self,
+        batch: DataProto,
+        *,
+        count_key: str,
+        penalty_key: str,
+        label: str,
+        alpha_win: float,
+        alpha_lose: float,
+        beta_lose: float,
+        winner_threshold: float,
+        std_threshold: float,
+    ) -> None:
+        """Subtract a group-relative anchored *count* penalty in place.
+
+        Generic over the per-rollout count being shaped (``count_key`` in
+        ``non_tensor_batch``): ``num_tool_calls`` for the tool-call penalty,
+        ``num_answer_docs`` for the answer-document penalty, etc.
+
+        Operates on a single gen batch *before* ``filter_groups`` so the
+        penalized reward drives both group filtering and the GRPO/GSPO
+        advantage. The original (pre-penalty) reward is stashed in
+        ``non_tensor_batch['base_score']`` so winners/zero-reward rollouts can
+        still be identified for monitoring; this also lets multiple penalties
+        stack without one demoting winners (winner status + the per-group std
+        gate are always evaluated against the *base* reward, never the already
+        partially-penalized ``score``).
+
+        Requires ``uid``, ``score`` and ``count_key`` in ``non_tensor_batch``
+        (``score`` and the counts are emitted by
+        ``grpo/reward.py::compute_score``). If anything is missing we skip
+        silently rather than crash the step.
+        """
+        nt = batch.non_tensor_batch
+        if not ("uid" in nt and "score" in nt and count_key in nt):
+            print(
+                f"[{label}] missing one of uid/score/{count_key} in "
+                f"non_tensor_batch; skipping {label} for this batch.",
+                flush=True,
+            )
+            return
+
+        uids = nt["uid"]
+        # Winners + std gate are defined by the *base* (pre-penalty) reward so
+        # stacking multiple penalties never demotes a winner below threshold.
+        base_scores = np.asarray(
+            nt["base_score"] if "base_score" in nt else nt["score"],
+            dtype=np.float64,
+        )
+        counts = np.asarray(nt[count_key], dtype=np.float64)
+
+        penalties, _is_winner = compute_anchored_tool_penalty(
+            uids,
+            base_scores,
+            counts,
+            alpha_win=alpha_win,
+            alpha_lose=alpha_lose,
+            beta_lose=beta_lose,
+            winner_threshold=winner_threshold,
+            std_threshold=std_threshold,
+        )
+
+        # Stash the pre-penalty reward once (first penalty to run owns it), then
+        # subtract this penalty from the running ``score`` (drives filter_groups).
+        if "base_score" not in nt:
+            nt["base_score"] = base_scores.copy()
+        nt[penalty_key] = penalties.astype(np.float32)
+        nt["score"] = np.asarray(nt["score"], dtype=np.float64) - penalties
+
+        # Subtract the penalty from the sequence reward. GRPO/GSPO advantages
+        # depend only on the *sum* of ``token_level_scores`` over the response,
+        # but we still place the subtraction on a real response token (the last
+        # assistant token, mask==1) so it is never on padding.
+        tls = batch.batch["token_level_scores"]
+        resp_mask = batch.batch["response_mask"].bool()
+        bsz, seq_len = tls.shape
+
+        has_any = resp_mask.any(dim=1)
+        rev = torch.flip(resp_mask.int(), dims=[1])
+        last_idx = (seq_len - 1) - torch.argmax(rev, dim=1)
+        last_idx = torch.where(
+            has_any, last_idx, torch.full_like(last_idx, seq_len - 1)
+        )
+
+        pen_t = torch.as_tensor(penalties, dtype=tls.dtype, device=tls.device)
+        rows = torch.arange(bsz, device=tls.device)
+        tls[rows, last_idx] = tls[rows, last_idx] - pen_t
 
     # noqa: C901 — fit() is unavoidably long because it tracks v0.7.1's fit() body.
     def fit(self):
@@ -209,6 +302,54 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
         fg_max_num_gen_batches = (
             fg_cfg.get("max_num_gen_batches", 0) if fg_cfg is not None else 0
         ) or 0
+
+        # --- anchored tool-call penalty state ------------------------------------
+        tp_cfg = self.config.algorithm.get("tool_penalty", None)
+        tp_enable = bool(tp_cfg is not None and tp_cfg.get("enable", True))
+        tp_alpha_win = float(tp_cfg.get("alpha_win", 0.1)) if tp_cfg is not None else 0.1
+        tp_alpha_lose = float(tp_cfg.get("alpha_lose", 0.0)) if tp_cfg is not None else 0.0
+        tp_beta_lose = float(tp_cfg.get("beta_lose", 0.0)) if tp_cfg is not None else 0.0
+        tp_winner_threshold = (
+            float(tp_cfg.get("winner_threshold", 1.0)) if tp_cfg is not None else 1.0
+        )
+        tp_std_threshold = (
+            float(tp_cfg.get("std_threshold", 0.0)) if tp_cfg is not None else 0.0
+        )
+        if tp_enable:
+            print(
+                f"[tool_penalty] ENABLED. alpha_win={tp_alpha_win}, "
+                f"alpha_lose={tp_alpha_lose}, beta_lose={tp_beta_lose}, "
+                f"winner_threshold={tp_winner_threshold}, "
+                f"std_threshold={tp_std_threshold}",
+                flush=True,
+            )
+        # -------------------------------------------------------------------------
+
+        # --- anchored answer-document penalty state ------------------------------
+        # Same anchored-count mechanism as the tool-call penalty, but shapes the
+        # number of doc_ids a rollout emits in its ``<answer>`` (num_answer_docs):
+        # winners that answer with many docs (vs. the per-group winner mean) get
+        # docked, discouraging the policy from padding the answer to game recall.
+        adp_cfg = self.config.algorithm.get("answer_doc_penalty", None)
+        adp_enable = bool(adp_cfg is not None and adp_cfg.get("enable", False))
+        adp_alpha_win = float(adp_cfg.get("alpha_win", 0.05)) if adp_cfg is not None else 0.05
+        adp_alpha_lose = float(adp_cfg.get("alpha_lose", 0.0)) if adp_cfg is not None else 0.0
+        adp_beta_lose = float(adp_cfg.get("beta_lose", 0.0)) if adp_cfg is not None else 0.0
+        adp_winner_threshold = (
+            float(adp_cfg.get("winner_threshold", 1.0)) if adp_cfg is not None else 1.0
+        )
+        adp_std_threshold = (
+            float(adp_cfg.get("std_threshold", 0.0)) if adp_cfg is not None else 0.0
+        )
+        if adp_enable:
+            print(
+                f"[answer_doc_penalty] ENABLED. alpha_win={adp_alpha_win}, "
+                f"alpha_lose={adp_alpha_lose}, beta_lose={adp_beta_lose}, "
+                f"winner_threshold={adp_winner_threshold}, "
+                f"std_threshold={adp_std_threshold}",
+                flush=True,
+            )
+        # -------------------------------------------------------------------------
 
         rollout_n = self.config.actor_rollout_ref.rollout.n
         train_bsz = self.config.data.train_batch_size
@@ -353,6 +494,36 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
                     if reward_extra_infos_dict:
                         new_batch.non_tensor_batch.update(
                             {k: np.array(v) for k, v in reward_extra_infos_dict.items()}
+                        )
+
+                    # Group-relative anchored count penalties. Applied *before*
+                    # the filter so the penalized reward feeds both filter_groups
+                    # and the GRPO/GSPO advantage. No-op when disabled. Both stack
+                    # additively on the same base reward (winner status is judged
+                    # against ``base_score``, set by whichever runs first).
+                    if tp_enable:
+                        self._apply_count_penalty(
+                            new_batch,
+                            count_key="num_tool_calls",
+                            penalty_key="tool_call_penalty",
+                            label="tool_penalty",
+                            alpha_win=tp_alpha_win,
+                            alpha_lose=tp_alpha_lose,
+                            beta_lose=tp_beta_lose,
+                            winner_threshold=tp_winner_threshold,
+                            std_threshold=tp_std_threshold,
+                        )
+                    if adp_enable:
+                        self._apply_count_penalty(
+                            new_batch,
+                            count_key="num_answer_docs",
+                            penalty_key="answer_doc_penalty",
+                            label="answer_doc_penalty",
+                            alpha_win=adp_alpha_win,
+                            alpha_lose=adp_alpha_lose,
+                            beta_lose=adp_beta_lose,
+                            winner_threshold=adp_winner_threshold,
+                            std_threshold=adp_std_threshold,
                         )
 
                     # ================== filter_groups loop ==================
@@ -683,12 +854,85 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
                     _rlen = np.asarray(batch.non_tensor_batch["response_len"], dtype=np.float32)
                     metrics["response_length/q_99"] = float(np.percentile(_rlen, 99))
 
+                # Anchored tool-call penalty diagnostics: mean tool calls among
+                # winners (base reward == 1) vs. zero-reward rollouts, plus the
+                # mean penalty actually applied. ``base_score`` is the pre-penalty
+                # reward stashed by ``_apply_count_penalty``.
+                if (
+                    tp_enable
+                    and "base_score" in batch.non_tensor_batch
+                    and "num_tool_calls" in batch.non_tensor_batch
+                ):
+                    _base = np.asarray(batch.non_tensor_batch["base_score"], dtype=np.float64)
+                    _ntc = np.asarray(batch.non_tensor_batch["num_tool_calls"], dtype=np.float64)
+                    _win_mask = _base >= (tp_winner_threshold - 1e-6)
+                    _zero_mask = _base <= 1e-6
+                    metrics["tool_penalty/frac_winners"] = float(np.mean(_win_mask))
+
+                    # Mean per-group std of the (pre-penalty) reward — the
+                    # quantity gating the penalty via ``std_threshold``.
+                    if "uid" in batch.non_tensor_batch:
+                        _uids = np.asarray(batch.non_tensor_batch["uid"])
+                        _grp_stds = [
+                            float(np.std(_base[_uids == u])) for u in np.unique(_uids)
+                        ]
+                        if _grp_stds:
+                            metrics["tool_penalty/reward_std_mean"] = float(
+                                np.mean(_grp_stds)
+                            )
+                    if _win_mask.any():
+                        metrics["tool_penalty/mean_tool_calls_winners"] = float(
+                            _ntc[_win_mask].mean()
+                        )
+                    if _zero_mask.any():
+                        metrics["tool_penalty/mean_tool_calls_zero_reward"] = float(
+                            _ntc[_zero_mask].mean()
+                        )
+                    if "tool_call_penalty" in batch.non_tensor_batch:
+                        _pen = np.asarray(
+                            batch.non_tensor_batch["tool_call_penalty"], dtype=np.float64
+                        )
+                        metrics["tool_penalty/mean"] = float(_pen.mean())
+
+                # Anchored answer-document penalty diagnostics: mean answer-doc
+                # count among winners vs. zero-reward rollouts, plus the mean
+                # penalty actually applied.
+                if (
+                    adp_enable
+                    and "base_score" in batch.non_tensor_batch
+                    and "num_answer_docs" in batch.non_tensor_batch
+                ):
+                    _base = np.asarray(batch.non_tensor_batch["base_score"], dtype=np.float64)
+                    _nad = np.asarray(batch.non_tensor_batch["num_answer_docs"], dtype=np.float64)
+                    _win_mask = _base >= (adp_winner_threshold - 1e-6)
+                    _zero_mask = _base <= 1e-6
+                    metrics["answer_doc_penalty/frac_winners"] = float(np.mean(_win_mask))
+                    if _win_mask.any():
+                        metrics["answer_doc_penalty/mean_answer_docs_winners"] = float(
+                            _nad[_win_mask].mean()
+                        )
+                    if _zero_mask.any():
+                        metrics["answer_doc_penalty/mean_answer_docs_zero_reward"] = float(
+                            _nad[_zero_mask].mean()
+                        )
+                    if "answer_doc_penalty" in batch.non_tensor_batch:
+                        _pen = np.asarray(
+                            batch.non_tensor_batch["answer_doc_penalty"], dtype=np.float64
+                        )
+                        metrics["answer_doc_penalty/mean"] = float(_pen.mean())
+
                 if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
                     self.train_dataloader.sampler.update(batch=batch)
 
                 logger.log(data=metrics, step=self.global_steps)
 
-                progress_bar.update(1)
+                # Advance by the number of dataloader batches this optimizer step
+                # consumed (filter_groups pulls extra batches to refill the train
+                # batch). ``total_training_steps`` is computed upstream as
+                # ``len(train_dataloader) * total_epochs`` (= dataloader batches),
+                # so stepping by ``num_gen_batches`` lets the bar reach 100%.
+                # Stepping by 1 would cap the bar at ~50% with ~2 batches/step.
+                progress_bar.update(num_gen_batches)
                 self.global_steps += 1
 
                 if (
@@ -719,3 +963,203 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
                 total_filtered_groups = 0
                 total_filtered_all_zero = 0
                 total_filtered_all_one = 0
+
+    # ------------------------------------------------------------------
+    # Validation with trajectory saving
+    # ------------------------------------------------------------------
+
+    def _validate(self, merged: bool = False):
+        """Run validation and optionally save full rollout trajectories.
+
+        When ``trainer.val_trajectory_dir`` is set in the config, saves a
+        JSONL file per validation call to ``<val_trajectory_dir>/<step>.jsonl``.
+        Each line is one rollout with: step, uid, score, messages_full and
+        every key returned by the reward function (ndcg, f_beta, stopped_reason,
+        num_tool_calls, etc.).
+
+        All other behaviour is identical to the parent ``_validate``.
+        """
+        val_traj_dir: str | None = self.config.trainer.get("val_trajectory_dir", None)
+
+        data_source_lst = []
+        reward_extra_infos_dict: dict[str, list] = defaultdict(list)
+
+        sample_inputs = []
+        sample_outputs = []
+        sample_gts = []
+        sample_scores = []
+        sample_turns = []
+        sample_uids = []
+
+        # Extra accumulators for trajectory saving.
+        traj_messages_full: list = []
+        traj_uids: list = []
+        traj_gold_ids: list = []
+
+        for test_data in self.val_dataloader:
+            test_batch = DataProto.from_single_dict(test_data)
+
+            if "uid" not in test_batch.non_tensor_batch:
+                test_batch.non_tensor_batch["uid"] = np.array(
+                    [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
+                )
+
+            test_batch = test_batch.repeat(
+                repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
+            )
+
+            ground_truths = [
+                item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
+            ]
+            sample_gts.extend(ground_truths)
+
+            test_gen_batch = self._get_gen_batch(test_batch)
+            test_gen_batch.meta_info = {
+                "eos_token_id": self.tokenizer.eos_token_id,
+                "pad_token_id": self.tokenizer.pad_token_id,
+                "recompute_log_prob": False,
+                "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
+                "validate": True,
+                "global_steps": self.global_steps,
+            }
+            print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
+
+            size_divisor = self.config.actor_rollout_ref.rollout.agent.num_workers
+            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
+            test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+
+            if self.use_rm and "rm_scores" not in test_output_gen_batch_padded.batch.keys():
+                self.checkpoint_manager.sleep_replicas()
+                batch_reward = self._compute_reward_colocate(test_output_gen_batch_padded)
+                test_output_gen_batch_padded = test_output_gen_batch_padded.union(batch_reward)
+                self.checkpoint_manager.update_weights(self.global_steps)
+
+            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+
+            print("validation generation end")
+
+            output_ids = test_output_gen_batch.batch["responses"]
+            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+            sample_outputs.extend(output_texts)
+
+            test_batch = test_batch.union(test_output_gen_batch)
+            test_batch.meta_info["validate"] = True
+
+            input_ids = test_batch.batch["prompts"]
+            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+            sample_inputs.extend(input_texts)
+            sample_uids.extend(test_batch.non_tensor_batch["uid"])
+
+            # Collect messages_full for trajectory saving. Always extend by the
+            # batch size (filling None when absent) so traj_* stay aligned 1:1
+            # with sample_scores / reward_extra_infos_dict.
+            if val_traj_dir:
+                batch_uids = test_batch.non_tensor_batch["uid"].tolist()
+                if "messages_full" in test_output_gen_batch.non_tensor_batch:
+                    batch_msgs = test_output_gen_batch.non_tensor_batch["messages_full"].tolist()
+                else:
+                    batch_msgs = [None] * len(batch_uids)
+                if "gold_doc_ids" in test_output_gen_batch.non_tensor_batch:
+                    batch_gold = test_output_gen_batch.non_tensor_batch["gold_doc_ids"].tolist()
+                else:
+                    batch_gold = [None] * len(batch_uids)
+                traj_uids.extend(batch_uids)
+                traj_messages_full.extend(batch_msgs)
+                traj_gold_ids.extend(batch_gold)
+
+            reward_tensor, reward_extra_info = extract_reward(test_batch)
+
+            scores = reward_tensor.sum(-1).cpu().tolist()
+            sample_scores.extend(scores)
+
+            reward_extra_infos_dict["reward"].extend(scores)
+            for key, values in reward_extra_info.items():
+                if key not in reward_extra_infos_dict:
+                    reward_extra_infos_dict[key] = []
+                if isinstance(values, np.ndarray):
+                    reward_extra_infos_dict[key].extend(values.tolist())
+                else:
+                    reward_extra_infos_dict[key].extend(values if isinstance(values, list) else [values])
+
+            if "__num_turns__" in test_batch.non_tensor_batch:
+                sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
+
+            data_source_lst.append(
+                test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0])
+            )
+
+        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+
+        val_data_dir = self.config.trainer.get("validation_data_dir", None)
+        if val_data_dir:
+            self._dump_generations(
+                inputs=sample_inputs,
+                outputs=sample_outputs,
+                gts=sample_gts,
+                scores=sample_scores,
+                reward_extra_infos_dict=reward_extra_infos_dict,
+                dump_path=val_data_dir,
+            )
+
+        if val_traj_dir and traj_messages_full:
+            self._dump_val_trajectories(
+                uids=traj_uids,
+                messages_full=traj_messages_full,
+                gold_ids=traj_gold_ids,
+                scores=sample_scores,
+                reward_extra_infos_dict=reward_extra_infos_dict,
+                dump_path=val_traj_dir,
+            )
+
+        for key_info, lst in reward_extra_infos_dict.items():
+            assert len(lst) == 0 or len(lst) == len(sample_scores), (
+                f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
+            )
+
+        if merged:
+            print("_merge_validation_results validate result will be merged")
+            return {
+                "data_sources": data_source_lst,
+                "sample_uids": sample_uids,
+                "sample_turns": sample_turns,
+                "reward_extra_infos_dict": reward_extra_infos_dict,
+            }
+        data_sources = np.concatenate(data_source_lst, axis=0)
+        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+
+    def _dump_val_trajectories(
+        self,
+        uids: list,
+        messages_full: list,
+        gold_ids: list,
+        scores: list[float],
+        reward_extra_infos_dict: dict[str, list],
+        dump_path: str,
+    ) -> None:
+        """Save validation rollout trajectories to a JSONL file.
+
+        Each line: {step, uid, score, gold_ids, messages_full, <reward metrics>}.
+        File is named ``<dump_path>/<global_steps>.jsonl``.
+        """
+        os.makedirs(dump_path, exist_ok=True)
+        filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
+
+        n = len(uids)
+        lines = []
+        for i in range(n):
+            entry: dict[str, Any] = {
+                "step": self.global_steps,
+                "uid": uids[i] if i < len(uids) else None,
+                "score": scores[i] if i < len(scores) else None,
+                "gold_ids": gold_ids[i] if i < len(gold_ids) else None,
+                "messages_full": messages_full[i] if i < len(messages_full) else None,
+            }
+            for key, vals in reward_extra_infos_dict.items():
+                if len(vals) == n:
+                    entry[key] = vals[i]
+            lines.append(json.dumps(entry, ensure_ascii=False))
+
+        with open(filename, "w") as f:
+            f.write("\n".join(lines) + "\n")
+
+        print(f"Saved {n} val trajectories → {filename}")

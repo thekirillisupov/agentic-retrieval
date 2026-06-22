@@ -30,7 +30,7 @@ from typing import Any
 
 import pandas as pd
 
-from agent.prompts import get_prompt
+from agent.prompts import format_user_content, get_prompt
 
 log = logging.getLogger(__name__)
 
@@ -40,22 +40,70 @@ ABILITY = "agentic_retrieval"
 AGENT_NAME = "retrieval_react"
 
 
+# Datasets that share an index with another source but need their own
+# ``data_source`` for W&B / reward bookkeeping.
+DATA_SOURCE_INDEX_SOURCE: dict[str, str] = {
+    "ckr_per_doc_filtered_retrieval": "ckr",
+}
+
+
+def source_from_data_source(data_source: str) -> str:
+    """Map a reward ``data_source`` to a tool-server index key.
+
+    "musique_retrieval" -> "musique", "sbol_retrieval" -> "sbol". The rollout
+    loop uses this to pin each row's searches to the matching corpus index.
+    """
+    if data_source in DATA_SOURCE_INDEX_SOURCE:
+        return DATA_SOURCE_INDEX_SOURCE[data_source]
+    suffix = "_retrieval"
+    return data_source[: -len(suffix)] if data_source.endswith(suffix) else data_source
+
+
+
+
+def build_prompt_messages(
+    question: str, prompt_version: str
+) -> list[dict[str, str]]:
+    return [
+        {"role": "system", "content": get_prompt(prompt_version)},
+        {"role": "user", "content": format_user_content(question, prompt_version)},
+    ]
+
+
+def update_prompt_messages(
+    messages: list[dict[str, Any]], prompt_version: str
+) -> list[dict[str, Any]]:
+    system_prompt = get_prompt(prompt_version)
+    updated: list[dict[str, Any]] = []
+    for msg in messages:
+        role = msg["role"]
+        if role == "system":
+            updated.append({"role": "system", "content": system_prompt})
+        elif role == "user":
+            updated.append(
+                {
+                    "role": "user",
+                    "content": format_user_content(str(msg["content"]), prompt_version),
+                }
+            )
+        else:
+            updated.append(dict(msg))
+    return updated
+
+
 def _row(
     record: dict[str, Any],
     prompt_version: str,
     *,
     data_source: str = DEFAULT_DATA_SOURCE,
+    source: str | None = None,
 ) -> dict[str, Any]:
-    system_prompt = get_prompt(prompt_version)
     gold = list(record["gold_doc_ids"])
     return {
         "data_source": data_source,
         "ability": ABILITY,
         "agent_name": AGENT_NAME,
-        "prompt": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": record["question"]},
-        ],
+        "prompt": build_prompt_messages(record["question"], prompt_version),
         "reward_model": {
             "style": "ndcg_at_k",
             "ground_truth": json.dumps(gold, ensure_ascii=False),
@@ -65,6 +113,9 @@ def _row(
             "gold_doc_ids": gold,
             "prompt_version": prompt_version,
             "answer": record.get("answer", ""),
+            # Corpus this row routes to (one index per source on the tool
+            # server). The rollout loop pins every search to this source.
+            "source": source or source_from_data_source(data_source),
         },
     }
 
@@ -119,9 +170,46 @@ def build(
     return len(train), len(val)
 
 
+def backfill_parquet_source(path: Path) -> int:
+    """Set extra_info['source'] from the row's data_source where missing.
+
+    Existing parquets built before per-row routing lack extra_info['source'].
+    veRL keeps ``data_source`` as a separate top-level column (not inside
+    extra_info), so the rollout loop can't recover the corpus at runtime — it
+    must be baked into extra_info here. Idempotent: rows that already carry a
+    source are left unchanged.
+    """
+    df = pd.read_parquet(path)
+
+    def _fix(row: pd.Series) -> dict:
+        info = dict(row["extra_info"]) if row["extra_info"] is not None else {}
+        if not info.get("source"):
+            info["source"] = source_from_data_source(str(row["data_source"]))
+        return info
+
+    df["extra_info"] = df.apply(_fix, axis=1)
+    df.to_parquet(path, index=False)
+    counts = df["extra_info"].apply(lambda x: dict(x)["source"]).value_counts().to_dict()
+    log.info("backfilled source in %d rows of %s: %s", len(df), path, counts)
+    return len(df)
+
+
+def update_parquet_prompt(path: Path, prompt_version: str) -> int:
+    df = pd.read_parquet(path)
+    df["prompt"] = df["prompt"].apply(
+        lambda messages: update_prompt_messages(messages, prompt_version)
+    )
+    df["extra_info"] = df["extra_info"].apply(
+        lambda extra_info: {**dict(extra_info), "prompt_version": prompt_version}
+    )
+    df.to_parquet(path, index=False)
+    log.info("updated %d rows in %s to prompt_version=%s", len(df), path, prompt_version)
+    return len(df)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--in", dest="in_path", required=True,
+    parser.add_argument("--in", dest="in_path", default=None,
                         help="jsonl produced by eval_.build_train")
     parser.add_argument("--out-train", default="data/processed/musique/grpo_train.parquet")
     parser.add_argument("--out-val", default="data/processed/musique/grpo_val.parquet")
@@ -136,8 +224,30 @@ def main() -> None:
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument(
+        "--update-parquet",
+        type=Path,
+        default=None,
+        help="Rewrite an existing parquet in place with a new prompt version.",
+    )
+    parser.add_argument(
+        "--backfill-source",
+        type=Path,
+        nargs="+",
+        default=None,
+        help="Backfill extra_info['source'] from data_source in these parquet(s).",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+    if args.backfill_source is not None:
+        for p in args.backfill_source:
+            backfill_parquet_source(p)
+        return
+    if args.update_parquet is not None:
+        update_parquet_prompt(args.update_parquet, args.prompt_version)
+        return
+    if args.in_path is None:
+        parser.error("--in is required unless --update-parquet is set")
     build(
         Path(args.in_path),
         Path(args.out_train),

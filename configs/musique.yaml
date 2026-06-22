@@ -23,7 +23,7 @@ embedder:
 
 index:
   dir: ./indexes/musique/
-  top_k_default: 10
+  top_k_default: 8
   top_k_max: 50
   use_gpu: false
   gpu_id: 3
@@ -32,7 +32,7 @@ index:
 agent:
   max_turns: 8
   max_tool_calls: 10
-  prompt_version: v1_edit
+  prompt_version: v2
 
 eval:
   raw_musique_dir: ./data/raw/musique/
