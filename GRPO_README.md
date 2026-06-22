@@ -206,7 +206,7 @@ clean and corrupted trajectories. Useful when you change anything in
 ```bash
 python - <<'PY'
 import json, pandas as pd, httpx
-from agent.prompts import LOCAL_SEARCH_TOOL_SCHEMA, get_prompt
+from agent.prompts import get_tool_schemas, get_prompt
 from grpo.reward import compute_score
 from grpo.ti_to_check import _normalize_token_ids, check_consistency
 from transformers import AutoTokenizer
@@ -227,13 +227,13 @@ print(httpx.get("http://localhost:8100/healthz", timeout=5).json())
 
 # (4) TI/TO clean + injected mismatch
 tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-14B", trust_remote_code=True)
-msgs = [{"role":"system","content":get_prompt("v1")},
+msgs = [{"role":"system","content":get_prompt("v2")},
         {"role":"user","content":"hi"},
         {"role":"assistant","content":"<answer>x</answer>"}]
 full = _normalize_token_ids(tok.apply_chat_template(
-    msgs, add_generation_prompt=False, tools=[LOCAL_SEARCH_TOOL_SCHEMA], tokenize=True))
+    msgs, add_generation_prompt=False, tools=get_tool_schemas("v2"), tokenize=True))
 prompt = _normalize_token_ids(tok.apply_chat_template(
-    msgs[:2], add_generation_prompt=True, tools=[LOCAL_SEARCH_TOOL_SCHEMA], tokenize=True))
+    msgs[:2], add_generation_prompt=True, tools=get_tool_schemas("v2"), tokenize=True))
 resp = full[len(prompt):]
 ok = check_consistency(tokenizer=tok, messages_full=msgs,
                        prompt_ids=prompt, response_ids=resp,

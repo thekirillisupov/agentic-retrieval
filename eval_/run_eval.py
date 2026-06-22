@@ -15,6 +15,7 @@ import yaml
 from tqdm import tqdm
 
 from agent.harness import AgentHarness, ToolServerClient
+from agent.prompts import format_user_content, profile_for_source
 from agent.schemas import AgentInput, Message
 from eval_.baseline import load_eval
 from eval_.metrics import aggregate, evaluate_one
@@ -30,6 +31,7 @@ def run_agent_eval(
     max_tool_calls: int | None = None,
     subset_size: int | None = None,
     suffix: str = "",
+    wrap_client: bool = False,
 ) -> dict:
     eval_path = Path(cfg["eval"]["eval_dataset_path"])
     eval_rows = load_eval(
@@ -63,14 +65,20 @@ def run_agent_eval(
     stop_counts: dict[str, int] = {}
     try:
         for i, row in enumerate(tqdm(eval_rows, desc="agent eval")):
+            question = row["question"]
+            row_source = row.get("source") or cfg["index"].get("default_source")
+            row_pv = profile_for_source(row_source) if row_source else cfg["agent"].get("prompt_version", "v2")
+            if wrap_client:
+                question = format_user_content(question, row_pv)
             agent_input = AgentInput(
-                messages=[Message(role="user", content=row["question"])],
+                messages=[Message(role="user", content=question)],
                 max_turns=cfg["agent"]["max_turns"],
                 max_tool_calls=max_tool_calls or cfg["agent"]["max_tool_calls"],
                 top_k_default=cfg["index"].get("top_k_default", 10),
+                source=row_source,
             )
             try:
-                result = harness.run(agent_input, gold_doc_ids=row["gold_doc_ids"])
+                result = harness.run(agent_input, gold_doc_ids=row["gold_doc_ids"], prompt_version=row_pv)
             except Exception as e:
                 log.exception("agent run failed for %s", row["question_id"])
                 stop_counts["error"] = stop_counts.get("error", 0) + 1
@@ -142,6 +150,11 @@ def main() -> None:
     parser.add_argument(
         "--model-name", default=None, help="Override model.name from config"
     )
+    parser.add_argument(
+        "--wrap-client",
+        action="store_true",
+        help="Wrap question as <client>...</client> (v2_search_only conversation format)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -155,7 +168,10 @@ def main() -> None:
         for budget in sweep:
             log.info("=== budget=%d ===", budget)
             summary = run_agent_eval(
-                cfg, max_tool_calls=budget, suffix=f"budget_{budget}"
+                cfg,
+                max_tool_calls=budget,
+                suffix=f"budget_{budget}",
+                wrap_client=args.wrap_client,
             )
             runs.append({"max_tool_calls": budget, "summary": summary})
             log.info(
@@ -170,7 +186,7 @@ def main() -> None:
             json.dumps({"sweep": runs}, indent=2, ensure_ascii=False)
         )
     else:
-        summary = run_agent_eval(cfg)
+        summary = run_agent_eval(cfg, wrap_client=args.wrap_client)
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         Path(args.out).write_text(json.dumps(summary, indent=2, ensure_ascii=False))
         log.info(

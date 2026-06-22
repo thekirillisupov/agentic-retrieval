@@ -113,7 +113,8 @@ from agent.parser import parse_answer
 from agent.prompts import (
     get_tool_schemas,
     render_grep_results,
-    render_search_results,
+    render_neighbours_results,
+    render_search_results_json,
 )
 
 log = logging.getLogger(__name__)
@@ -152,7 +153,7 @@ def _parse_qwen_tool_calls(text: str) -> list[dict[str, Any]]:
                 {
                     "id": f"call_{uuid.uuid4().hex[:8]}",
                     "type": "function",
-                    "function": {"name": name, "arguments": json.dumps(args)},
+                    "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
                 }
             )
             continue
@@ -164,7 +165,7 @@ def _parse_qwen_tool_calls(text: str) -> list[dict[str, Any]]:
                     "type": "function",
                     "function": {
                         "name": j.get("name", ""),
-                        "arguments": json.dumps(j.get("arguments", {})),
+                        "arguments": json.dumps(j.get("arguments", {}), ensure_ascii=False),
                     },
                 }
             )
@@ -238,6 +239,14 @@ class RetrievalReActAgentLoop(AgentLoopBase):
         self.tool_names: set[str] = {
             t.strip() for t in _raw_tools.split(",") if t.strip()
         }
+        # Fallback corpus when a row doesn't carry one. Per-row routing prefers
+        # extra_info["source"] (written by data_prep). Empty -> tool server default.
+        self.default_source: str = str(_g("default_source", "") or "")
+        # Whether a model-emitted `source` tool arg may override the per-row
+        # pinned corpus. Default False: every search/get_neighbours in a rollout
+        # is pinned to the row's corpus, so one question == one base. Flip to
+        # True later to train the model to choose sources itself.
+        self.allow_model_source: bool = bool(_g("allow_model_source", False))
         # After this many consecutive tool-server failures the worker triggers
         # a /reload on the server. Set to 0 to disable the circuit breaker.
         # Sized for ~128 agent workers: a single brownout (e.g. weight-update
@@ -362,11 +371,15 @@ class RetrievalReActAgentLoop(AgentLoopBase):
     # ------------------------------------------------------------------ tool
 
     async def _call_tool(
-        self, name: str, arguments: dict[str, Any]
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        pinned_source: str = "",
+        seen: set[str] | None = None,
     ) -> tuple[str, dict[str, Any]]:
         _SEARCH_NAMES = {"local_search", "search"}
 
-        if name not in _SEARCH_NAMES and name != "grep":
+        if name not in _SEARCH_NAMES and name not in ("grep", "get_neighbours"):
             return json.dumps({"error": f"unknown tool: {name}"}), {
                 "error": "unknown_tool"
             }
@@ -377,12 +390,31 @@ class RetrievalReActAgentLoop(AgentLoopBase):
             top_k = self.top_k_default
         top_k = max(1, min(top_k, self.top_k_max))
 
+        # By default the per-row pinned corpus wins, so one question stays in one
+        # base. Only when allow_model_source is set may a model-emitted `source`
+        # override it (for training the model to choose sources).
+        if self.allow_model_source:
+            source = str(arguments.get("source") or "").strip() or pinned_source
+        else:
+            source = pinned_source
+
         if name in _SEARCH_NAMES:
             query = str(arguments.get("query", "")).strip()
+            # Over-fetch so that after deduplication against `seen` we still
+            # return ~top_k new docs (mirrors agent/harness.py). Only meaningful
+            # when dedup is active (seen is not None).
+            fetch_k = (
+                min(top_k + len(seen), self.top_k_max)
+                if seen is not None
+                else top_k
+            )
+            body: dict[str, Any] = {"query": query, "top_k": fetch_k}
+            if source:
+                body["source"] = source
             try:
                 r = await self._http.post(
                     f"{self.tool_server_url}/local_search",
-                    json={"query": query, "top_k": top_k},
+                    json=body,
                 )
                 r.raise_for_status()
                 payload = r.json()
@@ -392,21 +424,54 @@ class RetrievalReActAgentLoop(AgentLoopBase):
 
             self._record_tool_success()
             results = payload.get("results", [])
-            rendered = render_search_results(results)
+            # Render the ranked hits in order, preserving the position of every
+            # passage but optimising context: NEW docs are shown as full
+            # passages, already-seen docs as id-only placeholders
+            # ({"doc_id": ..., "seen": true}). We over-fetched above; walk in
+            # rank order until top_k NEW docs have been shown, then stop (any
+            # trailing seen ids below the last new doc are dropped). Only NEW
+            # docs are added to `seen`.
+            if seen is not None:
+                display: list[dict[str, Any]] = []
+                new_doc_ids: list[str] = []
+                for r in results:
+                    did = r["doc_id"]
+                    if did in seen:
+                        display.append({"doc_id": did})
+                    else:
+                        display.append(r)
+                        seen.add(did)
+                        new_doc_ids.append(did)
+                        if len(new_doc_ids) >= top_k:
+                            break
+                new_results = display
+            else:
+                new_results = results
+                new_doc_ids = [r["doc_id"] for r in results]
+            rendered = render_search_results_json(new_results)
             summary: dict[str, Any] = {
-                "num_results": len(results),
-                "top_doc_ids": [r["doc_id"] for r in results],
+                "num_results": len(new_results),
+                "num_new": len(new_doc_ids),
+                "num_seen_refs": len(new_results) - len(new_doc_ids),
+                # Only the newly-shown docs (full passages). Seen placeholders
+                # were already reported when first surfaced.
+                "top_doc_ids": new_doc_ids,
                 "doc_ids_with_scores": [
-                    {"doc_id": r["doc_id"], "score": float(r["score"])} for r in results
+                    {"doc_id": r["doc_id"], "score": float(r["score"])}
+                    for r in new_results
+                    if "score" in r
                 ],
             }
 
-        else:  # grep
+        elif name == "grep":
             pattern = str(arguments.get("pattern", "")).strip()
+            grep_body: dict[str, Any] = {"pattern": pattern, "top_k": top_k}
+            if source:
+                grep_body["source"] = source
             try:
                 r = await self._http.post(
                     f"{self.tool_server_url}/grep",
-                    json={"pattern": pattern, "top_k": top_k},
+                    json=grep_body,
                 )
                 r.raise_for_status()
                 payload = r.json()
@@ -421,6 +486,37 @@ class RetrievalReActAgentLoop(AgentLoopBase):
             summary = {
                 "num_results": len(results),
                 "total_matches": total_matches,
+                "top_doc_ids": [r["doc_id"] for r in results],
+            }
+
+        else:  # get_neighbours
+            doc_id_arg = str(arguments.get("doc_id", "")).strip()
+            try:
+                window = int(arguments.get("window", 1))
+            except (TypeError, ValueError):
+                window = 1
+            window = max(1, min(window, 10))
+            nb_body: dict[str, Any] = {"doc_id": doc_id_arg, "window": window}
+            if source:
+                nb_body["source"] = source
+            try:
+                r = await self._http.post(
+                    f"{self.tool_server_url}/get_neighbours",
+                    json=nb_body,
+                )
+                r.raise_for_status()
+                payload = r.json()
+            except Exception as e:  # pragma: no cover - net errors
+                await self._record_tool_error(e)
+                return json.dumps({"error": str(e), "results": []}), {"error": str(e)}
+
+            self._record_tool_success()
+            results = payload.get("results", [])
+            status = str(payload.get("status", "ok"))
+            rendered = render_neighbours_results(results, status, doc_id_arg, window)
+            summary = {
+                "num_results": len(results),
+                "status": status,
                 "top_doc_ids": [r["doc_id"] for r in results],
             }
 
@@ -452,6 +548,17 @@ class RetrievalReActAgentLoop(AgentLoopBase):
         metrics: dict[str, Any] = {}
 
         prompt_version = str(extra_info.get("prompt_version", "v1"))
+        # Per-row corpus: prefer an explicit `source`, else derive from
+        # `data_source` (e.g. "musique_retrieval" -> "musique"), else the
+        # configured default. Pins every search to the matching index.
+        row_source = str(extra_info.get("source") or "").strip()
+        if not row_source:
+            ds = str(extra_info.get("data_source") or "").strip()
+            if ds.endswith("_retrieval"):
+                ds = ds[: -len("_retrieval")]
+            row_source = ds
+        if not row_source:
+            row_source = self.default_source
         _tool_schemas = get_tool_schemas(prompt_version)
         if self.tool_names:
             filtered = [
@@ -523,10 +630,12 @@ class RetrievalReActAgentLoop(AgentLoopBase):
                     except json.JSONDecodeError:
                         args = {}
                     rendered, summary = await self._call_tool(
-                        tc["function"]["name"], args
+                        tc["function"]["name"], args, pinned_source=row_source, seen=seen
                     )
                     num_tool_calls += 1
 
+                    # For non-search tools (grep, get_neighbours) `seen` is not
+                    # updated inside _call_tool, so we still track them here.
                     for did in summary.get("top_doc_ids", []):
                         seen.add(did)
                     tool_call_traces.append(

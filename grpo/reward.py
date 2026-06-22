@@ -39,6 +39,7 @@ log via ``extra_fields``):
     response_len      - tokens the policy produced this rollout
     stopped_reason    - terminal state of the rollout
     num_tool_calls    - number of tool calls executed
+    num_answer_docs   - number of doc_ids the rollout emitted in ``<answer>``
     answered          - 1.0 iff the rollout ended in ``answer``
 
 Filtering zero-variance groups stays veRL's responsibility (see
@@ -168,5 +169,6 @@ def compute_score(
         "response_len": float(response_len),
         "stopped_reason": stopped,
         "num_tool_calls": float(info.get("num_tool_calls", 0)),
+        "num_answer_docs": float(len(ranked)),
         "answered": float(answered),
     }

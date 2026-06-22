@@ -1,5 +1,7 @@
-# Unioned SBOL + MuSiQue: merged FAISS index and GRPO parquet under data/processed/unioned/.
-# Tool server: CONFIG=configs/unioned.yaml bash scripts/serve_tool.sh
+# SBOL + MuSiQue served as SEPARATE per-source indexes (no longer one merged
+# index), so a MuSiQue query can never retrieve SBOL/rnd passages and vice versa.
+# FAISS indexes run on CPU (faiss-gpu not available). Embedder uses GPU 0.
+#   GPUS=0 CONFIG=configs/unioned.yaml bash scripts/serve_tool.sh
 model:
   name: Qwen/Qwen3.5-35B-A3B
   vllm_url: http://localhost:8000/v1
@@ -24,17 +26,31 @@ embedder:
   pooling: "cls"
 
 index:
-  dir: ./indexes/unioned/
   top_k_default: 10
   top_k_max: 50
-  use_gpu: false
-  gpu_id: 3
+  use_gpu: false           # faiss-gpu is not available in this env; CPU search is <20ms at this scale
   cache_size: 10000
+  # Source queried when a request omits `source` and the row carries none.
+  default_source: musique
+  # One FAISS index per source, each pinned to its own visible-device ordinal
+  # (after CUDA_VISIBLE_DEVICES from scripts/serve_tool.sh). gpu_id is that
+  # visible ordinal, not the physical GPU id.
+  sources:
+    musique:
+      dir: ./indexes/musique/
+    sbol:
+      dir: ./indexes/sbol/
+    # Source key is "rnd" (matches data_source "rnd_retrieval" -> "rnd"); the
+    # FAISS index lives under indexes/rnd_index/.
+    rnd:
+      dir: ./indexes/rnd_index/
+    ckr:
+      dir: ./indexes/ckr_index/
 
 agent:
   max_turns: 8
   max_tool_calls: 10
-  prompt_version: v1_edit
+  prompt_version: v2
 
 eval:
   processed_dir: ./data/processed/unioned/

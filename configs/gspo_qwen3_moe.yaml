@@ -46,7 +46,7 @@ algorithm:
   adv_estimator: grpo                  # group-relative advantages (GSPO keeps these)
   norm_adv_by_std_in_grpo: true
   use_kl_in_reward: true
-  kl_coef: 0.005
+  kl_coef: 0.01
   gamma: 1.0
   lam: 1.0
   filter_groups:
@@ -54,6 +54,33 @@ algorithm:
     metric: score
     max_num_gen_batches: 0 # how many fresh dataloader batches you'll spend trying to assemble one update batch 
     # max_num_gen_batches * batch_size * rollouts_n
+  # Group-relative, anchored tool-call penalty (Perplexity "Advancing
+  # Search-Augmented Language Models"). For each GSPO group g, winners are
+  # rollouts with reward == winner_threshold. A per-group baseline is sampled
+  # b_g ~ Unif[mean_{W_g} c, mean_{W_g} c + 1]; excess delta_i = max(0, c_i - b_g);
+  # p_i = 1 - exp(-delta_i); penalty = alpha_win*p_i for winners, else
+  # alpha_lose*p_i + beta_lose. Penalty only applied when the per-group reward
+  # std > std_threshold; empty winner set => no penalty. Subtracted from the
+  # reward *before* filter_groups / advantage.
+  tool_penalty:
+    enable: true
+    alpha_win: 0.05
+    alpha_lose: 0.0
+    beta_lose: 0.0
+    winner_threshold: 1.0
+    std_threshold: 0.0
+  # Same anchored-count mechanism, but on the number of doc_ids each rollout
+  # emits in its <answer> (num_answer_docs from grpo/reward.py). Winners that
+  # answer with many docs relative to the per-group winner mean get docked,
+  # discouraging the policy from padding the answer list to game recall.
+  # Stacks additively with tool_penalty on the same base reward.
+  answer_doc_penalty:
+    enable: true
+    alpha_win: 0.05
+    alpha_lose: 0.0
+    beta_lose: 0.0
+    winner_threshold: 1.0
+    std_threshold: 0.0
 
 actor_rollout_ref:
   hybrid_engine: true
@@ -88,7 +115,7 @@ actor_rollout_ref:
       lr_warmup_steps_ratio: 0.03
       min_lr: 1.0e-7                   # 10% of peak LR (Megatron expects absolute min_lr)
       clip_grad: 1.0
-      use_checkpoint_opt_param_scheduler: false   # restore num_steps from ckpt so warmup isn't replayed
+      use_checkpoint_opt_param_scheduler: true   # restore num_steps from ckpt so warmup isn't replayed
       override_optimizer_config:
         optimizer_offload_fraction: 1
         overlap_cpu_optimizer_d2h_h2d: true
@@ -140,28 +167,28 @@ actor_rollout_ref:
     top_p: 0.8
     top_k: -1
     do_sample: true
-    prompt_length: 1000   #  covers only the initial prompt_ids
-    response_length: 12000  # the response window. It contains all turns accumulated during the loop: assistant-generated tokens (mask=1) + tool-result tokens appended with mask=0
-    gpu_memory_utilization: 0.50   # raised from 0.40: 35B-A3B TP=2 shard is ~35 GB → needs >43% budget just for weights
-    max_num_seqs: 8                # reduced from 16 to keep KV cache footprint small at the higher utilisation
+    prompt_length: 2048   # initial prompt_ids; SBOL multi-turn dialogs reach ~1550 tok
+    response_length: 24576  # trimmed from 28000 to cap worst-case LM-head logits memory in the actor backward (q99 rollout ≈26887 tok; longest 1% get truncated)
+    gpu_memory_utilization: 0.45   # lowered from 0.50 to leave more headroom for the Megatron actor backward on GPU 0
+    max_num_seqs: 16                # reduced from 16 to keep KV cache footprint small at the higher utilisation
     tensor_model_parallel_size: 2      # vLLM TP
     enforce_eager: false
     free_cache_engine: true
-    max_model_len: 13000
+    max_model_len: 26624   # response_length (24576) + prompt_length (2048)
     dtype: bfloat16
     # log_prob_use_dynamic_bsz: false
-    log_prob_micro_batch_size_per_gpu: 2
+    log_prob_micro_batch_size_per_gpu: 1
     # log_prob_max_token_len_per_gpu: 20480   # match actor budget to keep entropy logits in memory
     checkpoint_engine:
       update_weights_bucket_megabytes: 4096
     agent:
       agent_loop_config_path: configs/agent_loop_registry.yaml
-      num_workers: 128
+      num_workers: 64
     multi_turn:
       enable: true
       max_assistant_turns: 6
       max_user_turns: 0
-      tool_response_truncate_side: right
+      tool_response_truncate_side: left
       max_tool_response_length: 4096
     val_kwargs:
       n: 1
@@ -170,7 +197,7 @@ actor_rollout_ref:
 
   ref:
     log_prob_use_dynamic_bsz: false
-    log_prob_micro_batch_size_per_gpu: 2
+    log_prob_micro_batch_size_per_gpu: 1
     # log_prob_max_token_len_per_gpu: 20480   # ref also needs the smaller budget
     megatron:
       # See note in actor.megatron above: TP must be <= num_key_value_heads (=2).
@@ -199,14 +226,22 @@ reward:
 
 agent_loop:
   retrieval_react:
-    tool_names: "local_search"
+    # Empty → no filtering; tools come entirely from get_tool_schemas(prompt_version).
+    # v2_search_only rows get [search]; v2 (ckr) rows get [search, get_neighbours].
+    tool_names: ""
     tool_server_url: http://localhost:8100
+    # Per-row routing: each parquet row's extra_info.source (written by
+    # grpo/data_prep.py from data_source) pins its searches to the matching
+    # index, so MuSiQue rows hit the musique index and SBOL rows hit sbol.
+    # default_source is only the fallback for rows that carry no source; leave
+    # empty to defer to the tool server's index.default_source.
+    default_source: ""
     tool_timeout_s: 30
-    max_turns: 8
-    max_tool_calls: 8
+    max_turns: 12
+    max_tool_calls: 16
     top_k_default: 5
     top_k_max: 50
-    max_response_tokens: 4096
+    max_response_tokens: 5120
     # Abort the rollout worker after this many consecutive tool-server failures
     # instead of silently returning empty results and degrading rewards.
     # Set to 0 to disable (old behaviour).
@@ -218,13 +253,14 @@ agent_loop:
 trainer:
   project_name: agentic_retrieval_gspo
   experiment_name: qwen3_moe_a3b_musique
-  total_epochs: 1
+  total_epochs: 2
   total_training_steps: null
   nnodes: 1
   n_gpus_per_node: 8
   save_freq: 10
   max_actor_ckpt_to_keep: 1
   test_freq: 5
+  val_trajectory_dir: trajectories_data/gspo_qwen3_moe
   logger: ['console', 'wandb']
   default_local_dir: checkpoints/gspo_qwen3_moe/
   val_before_train: true

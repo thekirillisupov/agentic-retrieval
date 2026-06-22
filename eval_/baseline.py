@@ -36,6 +36,7 @@ def run(
     top_k: int = 10,
     subset_size: int | None = None,
     timeout_s: float = 30.0,
+    source: str | None = None,
 ) -> dict:
     eval_rows = load_eval(eval_path, subset_size=subset_size)
     tool = ToolServerClient(tool_url, timeout_s=timeout_s)
@@ -44,7 +45,11 @@ def run(
     metrics = []
     try:
         for row in eval_rows:
-            response = tool.local_search(query=row["question"], top_k=top_k)
+            response = tool.local_search(
+                query=row["question"],
+                top_k=top_k,
+                source=row.get("source") or source,
+            )
             predicted = [r["doc_id"] for r in response.get("results", [])]
             gold = set(row["gold_doc_ids"])
             m = evaluate_one(predicted, gold, k=top_k)
@@ -98,6 +103,7 @@ def main() -> None:
         top_k=top_k,
         subset_size=subset,
         timeout_s=timeout_s,
+        source=cfg["index"].get("default_source"),
     )
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(json.dumps(summary, indent=2, ensure_ascii=False))

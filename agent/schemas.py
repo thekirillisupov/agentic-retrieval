@@ -53,6 +53,10 @@ class AgentInput:
     max_turns: int = 8
     max_tool_calls: int = 10
     top_k_default: int = 10
+    # Corpus this conversation belongs to. Pins every search to the matching
+    # index (per-row routing). None -> tool server's default_source. A `source`
+    # explicitly emitted by the model in a tool call overrides this.
+    source: str | None = None
 
 
 @dataclass
