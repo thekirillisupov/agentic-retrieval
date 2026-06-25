@@ -1,16 +1,20 @@
-"""Weight-only INT8 (W8A16) quantization of the agentic-retrieval actor for A100.
+"""INT8 quantization of the agentic-retrieval actor for A100. Two schemes (--scheme):
 
-Why W8A16 (and not W8A8) for *this* model:
-  * Qwen3.5-35B-A3B is a Qwen3-Next-family hybrid: GatedDeltaNet linear-attention
-    (SSM) layers interleaved with gated attention, plus a 3B-active MoE. Pure
-    W8A8-INT8 needs SmoothQuant to tame activation outliers, and SmoothQuant
-    corrupts the GatedDeltaNet norm params on this architecture (open llm-compressor
-    bug vllm-project/llm-compressor#2059). Weight-only quant does NOT touch
-    activations, so that failure mode cannot occur.
-  * On A100 weight-only INT8 still gives ~2x weight-memory savings (35B int8
-    weights ~= 35 GB, fits one 80 GB A100, TP=1) and a decode-time speedup from
-    halved weight-memory bandwidth, with bf16 activations preserving accuracy of
-    the RL-tuned policy.
+  W8A16 (default, safe): int8 weights + bf16 activations.
+  W8A8 (--scheme W8A8): int8 weights + int8 per-token-dynamic activations.
+
+Qwen3.5-35B-A3B is a Qwen3-Next-family hybrid: GatedDeltaNet linear-attention
+(SSM) layers interleaved with gated attention, plus a 3B-active MoE.
+
+  * W8A16 touches no activations, so the SmoothQuant norm-corruption failure
+    mode on this arch (llm-compressor#2059) cannot occur. ~2x weight-memory
+    savings (35B int8 weights ~= 35 GB, fits one 80 GB A100, TP=1) and a
+    decode-time bandwidth speedup, bf16 activations preserving the RL policy.
+  * W8A8 additionally quantizes activations to int8, using A100's int8 tensor
+    cores for a compute (prefill/throughput) speedup. We default SmoothQuant OFF
+    so #2059 cannot trigger (norms are never quantized — only Linear layers are,
+    and per-token-dynamic activation quant needs no calibration stats). Opt into
+    SmoothQuant with --smoothquant to A/B test accuracy, accepting the #2059 risk.
 
 Ignore list (kept identical in spirit to the official Qwen3-Next recipe):
   * lm_head                          — output head, always left in high precision.
@@ -31,7 +35,9 @@ Run (from repo root, in an inference/quant env — NOT the Megatron training env
     --model checkpoints/gspo_qwen3_moe/global_step_N/actor/huggingface \
     --questions data/calib/questions.jsonl \
     --output checkpoints/quantized/qwen3_5_35b_a3b_w8a16 \
+    --scheme W8A16 \
     --prompt-version v2_search_only --num-samples 512
+  # W8A8 variant: --scheme W8A8 --output .../qwen3_5_35b_a3b_w8a8
 
 Requires: llmcompressor>=0.9.0 (Qwen3-Next support), transformers, torch.
 """
@@ -74,14 +80,32 @@ def main() -> None:
         help="Which agent prompt profile to render calibration prompts with "
         "(v2_search_only for single-source rows, v2 for ckr/get_neighbours rows).",
     )
+    ap.add_argument(
+        "--scheme",
+        default="W8A16",
+        choices=["W8A16", "W8A8"],
+        help="W8A16 = int8 weights, bf16 activations (safe default). "
+        "W8A8 = int8 weights + int8 per-token-dynamic activations; uses A100's "
+        "int8 tensor cores for a compute speedup, at higher accuracy risk on this "
+        "GatedDeltaNet hybrid (see --smoothquant and llm-compressor#2059).",
+    )
+    ap.add_argument(
+        "--smoothquant",
+        action="store_true",
+        help="W8A8 only: prepend SmoothQuant to migrate activation outliers into "
+        "weights. Can improve W8A8 accuracy, BUT corrupts GatedDeltaNet norm params "
+        "on Qwen3-Next (llm-compressor#2059). OFF by default; enable to A/B test.",
+    )
+    ap.add_argument("--smoothquant-strength", type=float, default=0.8)
     ap.add_argument("--num-samples", type=int, default=512)
     ap.add_argument("--max-seq-len", type=int, default=2048)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument(
         "--rtn",
         action="store_true",
-        help="Skip GPTQ; use plain round-to-nearest weight quant (no calibration "
-        "forward passes). Fastest and zero-risk, slightly lower accuracy than GPTQ.",
+        help="Skip GPTQ; use plain round-to-nearest weight quant. For W8A8 the "
+        "activations are still int8 per-token-dynamic (no calibration needed). "
+        "Fastest and zero-risk on weights; slightly lower accuracy than GPTQ.",
     )
     ap.add_argument(
         "--dampening-frac",
@@ -90,6 +114,11 @@ def main() -> None:
         help="GPTQ Hessian dampening; raise (e.g. 0.05) if you hit numerical issues.",
     )
     args = ap.parse_args()
+
+    if args.smoothquant and args.scheme != "W8A8":
+        ap.error("--smoothquant only applies to --scheme W8A8")
+    if args.smoothquant and args.rtn:
+        ap.error("--smoothquant needs GPTQ calibration; drop --rtn")
 
     # Imported lazily so `--help` works without a GPU / heavy deps installed.
     import torch
@@ -109,10 +138,14 @@ def main() -> None:
     )
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
 
+    print(f"[quantize] scheme={args.scheme} gptq={not args.rtn} "
+          f"smoothquant={args.smoothquant}")
+
+    # W8A16 RTN and W8A8-dynamic RTN both need no calibration forward passes
+    # (W8A8 activations are quantized per-token at runtime, not from calib stats).
     if args.rtn:
-        # Weight-only RTN: no calibration data needed.
         recipe = QuantizationModifier(
-            targets="Linear", scheme="W8A16", ignore=IGNORE
+            targets="Linear", scheme=args.scheme, ignore=IGNORE
         )
         oneshot(model=model, recipe=recipe)
     else:
@@ -126,16 +159,29 @@ def main() -> None:
             max_seq_len=args.max_seq_len,
             seed=args.seed,
         )
-        recipe = GPTQModifier(
-            targets="Linear",
-            scheme="W8A16",
-            ignore=IGNORE,
-            dampening_frac=args.dampening_frac,
+        modifiers: list = []
+        if args.smoothquant:
+            # Opt-in only: see #2059 warning on --smoothquant. Shares the ignore
+            # list so it never folds scales into the GatedDeltaNet block.
+            from llmcompressor.modifiers.smoothquant import SmoothQuantModifier
+
+            modifiers.append(
+                SmoothQuantModifier(
+                    smoothing_strength=args.smoothquant_strength, ignore=IGNORE
+                )
+            )
+        modifiers.append(
+            GPTQModifier(
+                targets="Linear",
+                scheme=args.scheme,
+                ignore=IGNORE,
+                dampening_frac=args.dampening_frac,
+            )
         )
         oneshot(
             model=model,
             dataset=ds,
-            recipe=recipe,
+            recipe=modifiers if len(modifiers) > 1 else modifiers[0],
             max_seq_length=args.max_seq_len,
             num_calibration_samples=args.num_samples,
         )
