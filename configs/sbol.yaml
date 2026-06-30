@@ -33,7 +33,13 @@ index:
 agent:
   max_turns: 8
   max_tool_calls: 10
-  prompt_version: v2
+  prompt_version: v2_search_only
+  # Replace doc_ids with small per-episode integers (0,1,2… by first
+  # appearance) in tool output; the model answers with ints and the harness
+  # maps them back to doc_ids for NDCG. Independent of prompt_version.
+  use_id_map: false
+  # Must match the training config's agent_loop.retrieval_react.tool_budget_feedback.
+  tool_budget_feedback: false
 
 eval:
   raw_sbol_dir: ./data/raw/sbol/

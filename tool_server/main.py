@@ -25,6 +25,7 @@ from fastapi.responses import JSONResponse
 
 from tool_server.embedder import E5Embedder
 from tool_server.index import DocMeta, FaissIndex
+from tool_server.reranker import RerankError, Reranker
 from tool_server.schemas import (
     Doc,
     GetNeighboursRequest,
@@ -46,6 +47,14 @@ log = logging.getLogger(__name__)
 
 class State:
     embedder: E5Embedder | None = None
+    # Optional cross-encoder reranker (Qwen3-Reranker served by vLLM). When set,
+    # /local_search retrieves ``rerank_candidates`` FAISS hits, reranks them, and
+    # returns the top_k. None -> pure FAISS ranking (reranker disabled).
+    reranker: "Reranker | None" = None
+    # How many FAISS candidates to fetch before reranking. The reranker only
+    # reorders within this pool, so it must be >= the requested top_k to add any
+    # value; bigger pools trade reranker latency for recall.
+    rerank_candidates: int = 50
     # One FAISS index per source (e.g. {"musique": ..., "sbol": ...}). Each may
     # live on a different GPU (see per-source gpu_id in config). The embedder is
     # shared across all sources — the query is encoded once and searched against
@@ -165,6 +174,34 @@ def _resolve_source(source: str | None) -> str:
     )
 
 
+async def _maybe_rerank(
+    query: str, candidates: list[SearchHit], top_k: int
+) -> list[SearchHit]:
+    """Rerank FAISS candidates with the cross-encoder, returning the top_k.
+
+    Fail-soft: if the reranker is disabled or errors out, return the FAISS order
+    truncated to ``top_k``. A reranker brownout must degrade quality gracefully,
+    never fail the search (which would starve rewards under a 128-worker rollout).
+    The ``SearchHit.score`` of returned hits is replaced with the reranker's
+    relevance score so downstream consumers see the ranking signal that ordered
+    them.
+    """
+    if State.reranker is None or not candidates:
+        return candidates[:top_k]
+
+    try:
+        ranked = await State.reranker.rerank(query, [c.text for c in candidates], top_k)
+    except RerankError as exc:
+        log.warning("rerank failed (%s); falling back to FAISS order", exc)
+        return candidates[:top_k]
+
+    out: list[SearchHit] = []
+    for idx, score in ranked:
+        hit = candidates[idx]
+        out.append(hit.model_copy(update={"score": float(score)}))
+    return out
+
+
 def create_app(config_path: Path) -> FastAPI:
     cfg = yaml.safe_load(config_path.read_text())
 
@@ -190,15 +227,41 @@ def create_app(config_path: Path) -> FastAPI:
             query_prefix=emb_cfg["query_prefix"],
             passage_prefix=emb_cfg["passage_prefix"],
             pooling=emb_cfg.get("pooling", "mean"),
+            dtype=emb_cfg.get("dtype"),
+            add_eos=emb_cfg.get("add_eos", False),
+            padding_side=emb_cfg.get("padding_side"),
+            device_map=emb_cfg.get("device_map"),
         )
         State.indexes, State.default_source = _load_indexes(idx_cfg)
+
+        rr_cfg = cfg.get("reranker") or {}
+        if rr_cfg.get("enable"):
+            State.rerank_candidates = int(rr_cfg.get("candidates", 50))
+            State.reranker = Reranker(
+                url=rr_cfg["url"],
+                model=rr_cfg["model"],
+                timeout_s=float(rr_cfg.get("timeout_s", 30.0)),
+            )
+            log.info(
+                "reranker enabled: model=%s url=%s candidates=%d",
+                rr_cfg["model"],
+                rr_cfg["url"],
+                State.rerank_candidates,
+            )
+
         log.info(
-            "tool server ready: sources=%s (default=%s), %d docs total, embedder=%s",
+            "tool server ready: sources=%s (default=%s), %d docs total, embedder=%s, reranker=%s",
             {name: idx.num_docs for name, idx in State.indexes.items()},
             State.default_source,
             sum(idx.num_docs for idx in State.indexes.values()),
             State.embedder.name,
+            State.reranker.model if State.reranker else None,
         )
+
+    @app.on_event("shutdown")
+    async def _shutdown() -> None:
+        if State.reranker is not None:
+            await State.reranker.aclose()
 
     @app.post("/reload")
     async def reload_index() -> JSONResponse:
@@ -268,7 +331,9 @@ def create_app(config_path: Path) -> FastAPI:
             State.default_source = new_default
             State.reload_last_finished_at = time.monotonic()
             total = sum(idx.num_docs for idx in new_indexes.values())
-            log.info("indexes reloaded: %d docs across %d sources", total, len(new_indexes))
+            log.info(
+                "indexes reloaded: %d docs across %d sources", total, len(new_indexes)
+            )
             return JSONResponse({"status": "ok", "num_docs": total})
 
     @app.get("/healthz")
@@ -318,10 +383,17 @@ def create_app(config_path: Path) -> FastAPI:
             latency_ms = int((time.perf_counter() - t0) * 1000)
             return LocalSearchResponse(results=cached, latency_ms=latency_ms)
 
+        # With a reranker, FAISS is only the first stage: pull a larger candidate
+        # pool, then let the cross-encoder pick the final top_k from it.
+        retrieve_k = req.top_k
+        if State.reranker is not None:
+            retrieve_k = max(req.top_k, State.rerank_candidates)
+        retrieve_k = min(retrieve_k, index.num_docs)
+
         def _run_search() -> list[SearchHit]:
             assert State.embedder is not None
             emb = State.embedder.encode_queries([req.query])
-            scores, ids = index.search(emb, req.top_k)
+            scores, ids = index.search(emb, retrieve_k)
             out: list[SearchHit] = []
             for score, pos in zip(scores[0].tolist(), ids[0].tolist()):
                 if pos < 0:
@@ -339,7 +411,8 @@ def create_app(config_path: Path) -> FastAPI:
                 )
             return out
 
-        hits = await asyncio.to_thread(_run_search)
+        candidates = await asyncio.to_thread(_run_search)
+        hits = await _maybe_rerank(req.query, candidates, req.top_k)
 
         State.cache[cache_key] = hits
         if len(State.cache) > State.cache_size:
@@ -438,7 +511,9 @@ def create_app(config_path: Path) -> FastAPI:
             for index in State.indexes.values():
                 meta = index.lookup_by_doc_id(doc_id)
                 if meta is not None:
-                    docs.append(Doc(doc_id=meta.doc_id, title=meta.title, text=meta.text))
+                    docs.append(
+                        Doc(doc_id=meta.doc_id, title=meta.title, text=meta.text)
+                    )
                     break
         return LookupByIdResponse(docs=docs)
 

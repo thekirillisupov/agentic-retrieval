@@ -35,10 +35,10 @@ Available Tools:
 Instructions:
 1. Analyze the conversation history to understand the exact intent. 
 2. Break down the query into its key concepts and information needs.
-3. Execute searches using the available tool.
+3. Execute searches using the available tool. You may call search at most 3 times, so make each query count.
 4. When search does not find the relevant documents, try different approaches and strategies.
 
-When you have enough information, return a ranked list of doc_ids from most to least relevant.
+You have a budget of 3 search calls. Once you have enough information — or have used all 3 searches — return ONLY the ranked list of doc_ids from most to least relevant. Do not include any reasoning or explanation.
 
 Final answer format (must be exact):
 <answer>doc_id_1, doc_id_2, doc_id_3, ...</answer>
@@ -69,11 +69,12 @@ Instructions:
 4. When a relevant sliced chunk looks cut off, or the evidence likely continues into adjacent passages of the same document, use get_neighbours to read the surrounding chunks before judging relevance.
 5. When search does not find the relevant documents, try different approaches and strategies.
 
-When you have enough information, return a ranked list of doc_ids from most to least relevant. Include only doc_ids you have actually seen in search or get_neighbours results.
+You have a budget of 3 tool calls in total (search and get_neighbours combined), so use them deliberately. Once you have enough information — or have used all 3 tool calls — return ONLY the ranked list of doc_ids from most to least relevant. Do not include any reasoning or explanation.
 
 Final answer format (must be exact):
 <answer>doc_id_1, doc_id_2, doc_id_3, ...</answer>
 """
+
 
 PROMPT_V1_extending_web = """You are a retrieval subagent in a multi-agent system. Given a conversation, \
     identify and retrieve the most relevant documents that could help answer the user's latest message.
@@ -191,6 +192,33 @@ GET_NEIGHBOURS_TOOL_SCHEMA: dict[str, Any] = {
 }
 
 
+# Variant advertised when the harness serializes doc_ids to small integers
+# (see ``get_tool_schemas(..., use_id_map=True)``). Identical to
+# ``GET_NEIGHBOURS_TOOL_SCHEMA`` except ``doc_id`` is typed integer so
+# constrained decoding emits the serial id the model was shown.
+GET_NEIGHBOURS_TOOL_SCHEMA_SERIAL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "get_neighbours",
+        "description": (
+            "For a sliced chunk (one with file_name/index), return the neighbouring "
+            "chunks from the same file_name within +/-1 of its index. Has no "
+            "effect on independent chunks (those without file_name/index)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "doc_id": {
+                    "type": "integer",
+                    "description": "Integer id of a previously seen sliced chunk",
+                },
+            },
+            "required": ["doc_id"],
+        },
+    },
+}
+
+
 # --------------------------------------------------------------------------- #
 # Prompt registry — the single source of truth
 # --------------------------------------------------------------------------- #
@@ -261,12 +289,28 @@ def get_prompt(version: str) -> str:
     return profile.system_prompt
 
 
-def get_tool_schemas(prompt_version: str) -> list[dict[str, Any]]:
-    """Return the OpenAI tool-schema list for a given prompt version."""
+def get_tool_schemas(
+    prompt_version: str, use_id_map: bool = False
+) -> list[dict[str, Any]]:
+    """Return the OpenAI tool-schema list for a given prompt version.
+
+    When ``use_id_map`` is set the harness has replaced doc_id strings with
+    small integers, so any ``get_neighbours`` schema is swapped for its
+    integer-typed variant to keep the advertised arg type in sync with what the
+    model actually sees.
+    """
     profile = PROFILES.get(prompt_version)
-    if profile is None:
-        return [SEARCH_TOOL_SCHEMA_QUERY_ONLY]
-    return profile.tool_schemas
+    schemas = profile.tool_schemas if profile else [SEARCH_TOOL_SCHEMA_QUERY_ONLY]
+    if use_id_map:
+        schemas = [
+            (
+                GET_NEIGHBOURS_TOOL_SCHEMA_SERIAL
+                if s.get("function", {}).get("name") == "get_neighbours"
+                else s
+            )
+            for s in schemas
+        ]
+    return schemas
 
 
 def profile_for_source(source: str) -> str:
@@ -369,6 +413,57 @@ def render_search_results_json(results: list[dict[str, Any]]) -> str:
     return json.dumps([_entry(r) for r in results], ensure_ascii=False)
 
 
+def apply_tool_response_truncation(
+    rendered: str,
+    max_len: int,
+    truncate_side: str = "left",
+) -> str:
+    """Truncate a tool response string to *max_len* characters."""
+    if len(rendered) <= max_len:
+        return rendered
+    side = (truncate_side or "right").lower()
+    if side == "left":
+        return rendered[:max_len] + "...(truncated)"
+    if side == "right":
+        return "(truncated)..." + rendered[-max_len:]
+    half = max_len // 2
+    return rendered[:half] + "...(truncated)..." + rendered[-half:]
+
+
+def fit_search_display_to_budget(
+    results: list[dict[str, Any]],
+    max_len: int,
+    truncate_side: str = "left",
+) -> tuple[list[dict[str, Any]], str]:
+    """Drop leading/trailing hits until the JSON render fits *max_len*.
+
+    Returns ``(fitted_results, rendered)``. Entries that survive are fully
+    visible in *rendered*. If even a single hit overflows the budget, the
+    fitted list is empty and *rendered* is truncated mid-entry — callers must
+    not treat those documents as fully seen.
+    """
+    if not results:
+        return [], json.dumps([])
+
+    side = (truncate_side or "right").lower()
+    working = list(results)
+
+    while working:
+        rendered = render_search_results_json(working)
+        if len(rendered) <= max_len:
+            return working, rendered
+        if side == "right":
+            working.pop(0)
+        else:
+            # ``left`` and ``middle`` both drop lowest-priority trailing hits.
+            working.pop()
+
+    rendered = apply_tool_response_truncation(
+        render_search_results_json(results), max_len, truncate_side
+    )
+    return [], rendered
+
+
 def render_grep_result(doc_id: str, title: str, text: str) -> str:
     """Canonical per-result rendering for grep hits (no score)."""
     return f"[doc_id: {doc_id}]\nTitle: {title}\n\n{text}"
@@ -381,6 +476,40 @@ def render_grep_results(results: list[dict[str, Any]], total_matches: int) -> st
     header = f"Showing {len(results)} of {total_matches} match(es)."
     blocks = [render_grep_result(r["doc_id"], r["title"], r["text"]) for r in results]
     return header + "\n\n" + "\n\n---\n\n".join(blocks)
+
+
+def fit_grep_results_to_budget(
+    results: list[dict[str, Any]],
+    total_matches: int,
+    max_len: int,
+    truncate_side: str = "left",
+) -> tuple[list[dict[str, Any]], str]:
+    """Drop leading/trailing grep hits until the render fits *max_len*.
+
+    Mirrors :func:`fit_search_display_to_budget`: returns ``(fitted, rendered)``
+    where every surviving hit is fully visible in *rendered*. If even a single
+    hit overflows the budget the fitted list is empty and *rendered* is
+    truncated mid-block — callers must not treat those docs as fully seen.
+    """
+    if not results:
+        return [], render_grep_results(results, total_matches)
+
+    side = (truncate_side or "right").lower()
+    working = list(results)
+
+    while working:
+        rendered = render_grep_results(working, total_matches)
+        if len(rendered) <= max_len:
+            return working, rendered
+        if side == "right":
+            working.pop(0)
+        else:
+            working.pop()
+
+    rendered = apply_tool_response_truncation(
+        render_grep_results(results, total_matches), max_len, truncate_side
+    )
+    return [], rendered
 
 
 def render_neighbours_results(

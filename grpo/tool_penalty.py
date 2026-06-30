@@ -15,10 +15,10 @@ Definition
 ----------
 For a group ``g`` (all rollouts sharing one prompt ``uid``) define the winner
 set ``W_g = {i : reward_i == 1}`` (rollouts that solved the task). Then, with
-``c_i`` the number of tool calls in rollout ``i`` and ``c_mean`` the mean
-tool-call count over winners:
+``c_i`` the number of tool calls in rollout ``i`` and ``c_min`` / ``c_mean`` the
+min / mean tool-call count over winners:
 
-    b_g     ~ Unif[ c_mean ,  c_mean + 1 ]   (one draw / group)
+    b_g     ~ Unif[ c_min ,  c_mean ]   (one draw / group)
     delta_i := max(0, c_i - b_g)
     p_i     := 1 - exp(-delta_i)
     pen_i   := alpha_win  * p_i                 if i in W_g
@@ -105,9 +105,12 @@ def compute_anchored_tool_penalty(
             continue
 
         c_mean = float(c[win_idxs].mean())
-        # Unif[c_mean, c_mean + 1] (always a non-degenerate width-1 range).
-        # b_g = float(rng.uniform(c_mean, c_mean + 1.0))
-        b_g = c_mean
+        c_min = float(c[win_idxs].min())
+        # Sample the per-group anchor b_g ~ Unif[min_W c, mean_W c]: one draw
+        # per group, between the cheapest winner and the winner mean. When all
+        # winners share the same count (c_min == c_mean) this degenerates to
+        # that single value.
+        b_g = float(rng.uniform(c_min, c_mean)) if c_mean > c_min else c_min
 
         delta = np.maximum(0.0, c[idxs_arr] - b_g)
         p = 1.0 - np.exp(-delta)

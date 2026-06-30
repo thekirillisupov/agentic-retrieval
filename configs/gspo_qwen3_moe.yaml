@@ -44,9 +44,9 @@ data:
 
 algorithm:
   adv_estimator: grpo                  # group-relative advantages (GSPO keeps these)
-  norm_adv_by_std_in_grpo: true
+  norm_adv_by_std_in_grpo: false
   use_kl_in_reward: true
-  kl_coef: 0.01
+  kl_coef: 0.02
   gamma: 1.0
   lam: 1.0
   filter_groups:
@@ -57,14 +57,14 @@ algorithm:
   # Group-relative, anchored tool-call penalty (Perplexity "Advancing
   # Search-Augmented Language Models"). For each GSPO group g, winners are
   # rollouts with reward == winner_threshold. A per-group baseline is sampled
-  # b_g ~ Unif[mean_{W_g} c, mean_{W_g} c + 1]; excess delta_i = max(0, c_i - b_g);
+  # b_g ~ Unif[min_{W_g} c, mean_{W_g} c]; excess delta_i = max(0, c_i - b_g);
   # p_i = 1 - exp(-delta_i); penalty = alpha_win*p_i for winners, else
   # alpha_lose*p_i + beta_lose. Penalty only applied when the per-group reward
   # std > std_threshold; empty winner set => no penalty. Subtracted from the
   # reward *before* filter_groups / advantage.
   tool_penalty:
-    enable: true
-    alpha_win: 0.05
+    enable: false
+    alpha_win: 0.0
     alpha_lose: 0.0
     beta_lose: 0.0
     winner_threshold: 1.0
@@ -75,8 +75,8 @@ algorithm:
   # discouraging the policy from padding the answer list to game recall.
   # Stacks additively with tool_penalty on the same base reward.
   answer_doc_penalty:
-    enable: true
-    alpha_win: 0.05
+    enable: false
+    alpha_win: 0.00
     alpha_lose: 0.0
     beta_lose: 0.0
     winner_threshold: 1.0
@@ -168,13 +168,13 @@ actor_rollout_ref:
     top_k: -1
     do_sample: true
     prompt_length: 2048   # initial prompt_ids; SBOL multi-turn dialogs reach ~1550 tok
-    response_length: 24576  # trimmed from 28000 to cap worst-case LM-head logits memory in the actor backward (q99 rollout ≈26887 tok; longest 1% get truncated)
+    response_length: 15360  # trimmed from 28000 to cap worst-case LM-head logits memory in the actor backward (q99 rollout ≈26887 tok; longest 1% get truncated)
     gpu_memory_utilization: 0.45   # lowered from 0.50 to leave more headroom for the Megatron actor backward on GPU 0
     max_num_seqs: 16                # reduced from 16 to keep KV cache footprint small at the higher utilisation
     tensor_model_parallel_size: 2      # vLLM TP
     enforce_eager: false
     free_cache_engine: true
-    max_model_len: 26624   # response_length (24576) + prompt_length (2048)
+    max_model_len: 17408   # response_length (15360) + prompt_length (2048)
     dtype: bfloat16
     # log_prob_use_dynamic_bsz: false
     log_prob_micro_batch_size_per_gpu: 1
@@ -189,7 +189,7 @@ actor_rollout_ref:
       max_assistant_turns: 6
       max_user_turns: 0
       tool_response_truncate_side: left
-      max_tool_response_length: 4096
+      max_tool_response_length: 10240 # character length (len(string)).
     val_kwargs:
       n: 1
       temperature: 0.1
@@ -216,7 +216,7 @@ reward:
       # r = alpha * NDCG@k + (1 - alpha) * F_beta(output)
       #   - length_penalty + format_penalty
       #   + answer_bonus * [stopped_reason == "answer"]
-      ndcg_k: 5
+      ndcg_k: 8
       alpha: 1.0
       f_beta: 4.0
       length_alpha: 0.0              # length penalty is OPTIONAL; set >0 to enable
@@ -238,22 +238,33 @@ agent_loop:
     default_source: ""
     tool_timeout_s: 30
     max_turns: 12
-    max_tool_calls: 16
+    max_tool_calls: 3
+    # When true, the tool-call budget is surfaced to the policy: each tool
+    # response is suffixed with `[calls used: N/max_tool_calls]`, and once the
+    # budget is spent the rollout is NOT truncated — the model gets one final
+    # turn (with an explicit nudge) to emit its <answer>. When false, hitting
+    # max_tool_calls ends the rollout immediately (stopped_reason=max_tool_calls).
+    tool_budget_feedback: true
     top_k_default: 5
     top_k_max: 50
-    max_response_tokens: 5120
+    # max_response_tokens: 5120
     # Abort the rollout worker after this many consecutive tool-server failures
     # instead of silently returning empty results and degrading rewards.
     # Set to 0 to disable (old behaviour).
     # Sized for ~128 agent workers: a single brownout (e.g. weight update
     # spike) can produce a short burst of timeouts across many workers at
     # once. Pair with the singleflight /reload on the server (tool_server/main.py).
-    max_consecutive_tool_errors: 20
+    max_consecutive_tool_errors: 5
+    # Replace doc_ids with small per-rollout integers (0,1,2… by first
+    # appearance) in tool output; the model answers with ints and they are
+    # mapped back to doc_ids for reward/NDCG. Must match the eval harness'
+    # agent.use_id_map so train and eval stay consistent.
+    use_id_map: true
 
 trainer:
   project_name: agentic_retrieval_gspo
   experiment_name: qwen3_moe_a3b_musique
-  total_epochs: 2
+  total_epochs: 1
   total_training_steps: null
   nnodes: 1
   n_gpus_per_node: 8

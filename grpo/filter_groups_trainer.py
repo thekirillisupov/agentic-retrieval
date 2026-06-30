@@ -995,6 +995,9 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
         traj_messages_full: list = []
         traj_uids: list = []
         traj_gold_ids: list = []
+        traj_gold_ids_mapped: list = []
+        traj_trajectories_recall: list = []
+        traj_trajectories_ids: list = []
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -1063,9 +1066,30 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
                     batch_gold = test_output_gen_batch.non_tensor_batch["gold_doc_ids"].tolist()
                 else:
                     batch_gold = [None] * len(batch_uids)
+                if "gold_ids_mapped" in test_output_gen_batch.non_tensor_batch:
+                    batch_gold_mapped = (
+                        test_output_gen_batch.non_tensor_batch["gold_ids_mapped"].tolist()
+                    )
+                else:
+                    batch_gold_mapped = [None] * len(batch_uids)
+                if "trajectories_recall" in test_output_gen_batch.non_tensor_batch:
+                    batch_traj_recall = (
+                        test_output_gen_batch.non_tensor_batch["trajectories_recall"].tolist()
+                    )
+                else:
+                    batch_traj_recall = [None] * len(batch_uids)
+                if "trajectories_ids" in test_output_gen_batch.non_tensor_batch:
+                    batch_traj_ids = (
+                        test_output_gen_batch.non_tensor_batch["trajectories_ids"].tolist()
+                    )
+                else:
+                    batch_traj_ids = [None] * len(batch_uids)
                 traj_uids.extend(batch_uids)
                 traj_messages_full.extend(batch_msgs)
                 traj_gold_ids.extend(batch_gold)
+                traj_gold_ids_mapped.extend(batch_gold_mapped)
+                traj_trajectories_recall.extend(batch_traj_recall)
+                traj_trajectories_ids.extend(batch_traj_ids)
 
             reward_tensor, reward_extra_info = extract_reward(test_batch)
 
@@ -1106,6 +1130,9 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
                 uids=traj_uids,
                 messages_full=traj_messages_full,
                 gold_ids=traj_gold_ids,
+                gold_ids_mapped=traj_gold_ids_mapped,
+                trajectories_recall=traj_trajectories_recall,
+                trajectories_ids=traj_trajectories_ids,
                 scores=sample_scores,
                 reward_extra_infos_dict=reward_extra_infos_dict,
                 dump_path=val_traj_dir,
@@ -1132,13 +1159,22 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
         uids: list,
         messages_full: list,
         gold_ids: list,
+        gold_ids_mapped: list,
+        trajectories_recall: list,
+        trajectories_ids: list,
         scores: list[float],
         reward_extra_infos_dict: dict[str, list],
         dump_path: str,
     ) -> None:
         """Save validation rollout trajectories to a JSONL file.
 
-        Each line: {step, uid, score, gold_ids, messages_full, <reward metrics>}.
+        Each line: {step, uid, score, gold_ids, gold_ids_mapped,
+        trajectories_recall, trajectories_ids, messages_full, <reward metrics>}.
+        ``gold_ids_mapped`` holds per-rollout serial ints for each gold doc (when
+        ``use_id_map`` is on); ``null`` when a gold doc never appeared in tool
+        output. ``trajectories_recall`` is recall of gold docs against all doc
+        ids shown in tool responses; ``trajectories_ids`` lists those ids in
+        encounter order (mapped ints when ``use_id_map`` is on).
         File is named ``<dump_path>/<global_steps>.jsonl``.
         """
         os.makedirs(dump_path, exist_ok=True)
@@ -1152,6 +1188,15 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
                 "uid": uids[i] if i < len(uids) else None,
                 "score": scores[i] if i < len(scores) else None,
                 "gold_ids": gold_ids[i] if i < len(gold_ids) else None,
+                "gold_ids_mapped": (
+                    gold_ids_mapped[i] if i < len(gold_ids_mapped) else None
+                ),
+                "trajectories_recall": (
+                    trajectories_recall[i] if i < len(trajectories_recall) else None
+                ),
+                "trajectories_ids": (
+                    trajectories_ids[i] if i < len(trajectories_ids) else None
+                ),
                 "messages_full": messages_full[i] if i < len(messages_full) else None,
             }
             for key, vals in reward_extra_infos_dict.items():

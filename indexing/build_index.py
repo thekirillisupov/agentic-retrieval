@@ -46,6 +46,13 @@ def main() -> None:
     parser.add_argument("--config", default="configs/default.yaml")
     parser.add_argument("--corpus", default="data/processed/musique/corpus.jsonl")
     parser.add_argument("--out-dir", default=None, help="overrides index.dir")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="overrides embedder.batch_size (lower it for long-passage corpora "
+        "to avoid CUDA OOM, e.g. ckr HTML chunks)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -53,6 +60,7 @@ def main() -> None:
     emb_cfg = cfg["embedder"]
     idx_cfg = cfg["index"]
     out_dir = Path(args.out_dir or idx_cfg["dir"])
+    batch_size = args.batch_size or emb_cfg["batch_size"]
 
     corpus = load_corpus(Path(args.corpus))
     log.info("loaded %d passages from %s", len(corpus), args.corpus)
@@ -64,6 +72,10 @@ def main() -> None:
         query_prefix=emb_cfg["query_prefix"],
         passage_prefix=emb_cfg["passage_prefix"],
         pooling=emb_cfg.get("pooling", "mean"),
+        dtype=emb_cfg.get("dtype"),
+        add_eos=emb_cfg.get("add_eos", False),
+        padding_side=emb_cfg.get("padding_side"),
+        device_map=emb_cfg.get("device_map"),
     )
 
     # Truncation sanity check: the spec calls out >1% truncation as a smell.
@@ -76,7 +88,7 @@ def main() -> None:
 
     texts = [m.text for m in corpus]
     embeddings = encode_passages_streaming(
-        embedder, texts, batch_size=emb_cfg["batch_size"]
+        embedder, texts, batch_size=batch_size
     )
 
     index = build_index(

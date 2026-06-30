@@ -7,6 +7,7 @@ the indexing pipeline and the tool server can never accidentally mix conventions
 Supported pooling modes:
   "mean" — weighted average pool over non-padding tokens (E5-family)
   "cls"  — first [CLS] token (BGE-M3 and most BGE models)
+  "last" — last non-padding token (decoder embedders, e.g. Qwen3-Embedding)
 
 L2-normalization is enforced here too, so the index can use IndexFlatIP and get
 cosine similarity for free.
@@ -23,7 +24,13 @@ from transformers import AutoModel, AutoTokenizer
 
 log = logging.getLogger(__name__)
 
-PoolingMode = Literal["mean", "cls"]
+PoolingMode = Literal["mean", "cls", "last"]
+
+_DTYPES: dict[str, torch.dtype] = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
 
 
 class E5Embedder:
@@ -36,6 +43,10 @@ class E5Embedder:
         query_prefix: str = "query: ",
         passage_prefix: str = "passage: ",
         pooling: PoolingMode = "mean",
+        dtype: str | None = None,
+        add_eos: bool = False,
+        padding_side: str | None = None,
+        device_map: str | dict | None = None,
     ) -> None:
         self.name = name
         self.device = device
@@ -43,10 +54,65 @@ class E5Embedder:
         self.query_prefix = query_prefix
         self.passage_prefix = passage_prefix
         self.pooling = pooling
+        # Decoder-style embedders (Qwen3-Embedding) read the representation off
+        # the last token, so each sequence must end with <|endoftext|> and be
+        # left-padded; otherwise the "last" position would be a pad token.
+        self.add_eos = add_eos
+        # When set (e.g. "auto"), shard the model across every *visible* GPU via
+        # accelerate so no single GPU holds the full weights. This is layer/
+        # model sharding (the model is split by layer across devices), which is
+        # the practical in-process way to fit a large embedder alongside a
+        # GPU-hungry training job; it is not torch.distributed tensor parallel
+        # (that needs torchrun). Restrict which GPUs are used with
+        # CUDA_VISIBLE_DEVICES (see scripts/serve_tool.sh GPUS=...).
+        self.device_map = device_map
 
-        log.info("loading embedder %s on %s (pooling=%s)", name, device, pooling)
-        self.tokenizer = AutoTokenizer.from_pretrained(name)
-        self.model = AutoModel.from_pretrained(name, use_safetensors=True).to(device).eval()
+        log.info(
+            "loading embedder %s (device=%s device_map=%s pooling=%s dtype=%s add_eos=%s)",
+            name,
+            device,
+            device_map,
+            pooling,
+            dtype,
+            add_eos,
+        )
+        tok_kwargs = {}
+        if padding_side is None and pooling == "last":
+            padding_side = "left"
+        if padding_side is not None:
+            tok_kwargs["padding_side"] = padding_side
+        self.tokenizer = AutoTokenizer.from_pretrained(name, **tok_kwargs)
+
+        model_kwargs: dict = {"use_safetensors": True}
+        if dtype is not None:
+            if dtype not in _DTYPES:
+                raise ValueError(
+                    f"unknown dtype {dtype!r}; choose from {list(_DTYPES)}"
+                )
+            model_kwargs["dtype"] = _DTYPES[dtype]
+        if device_map is not None:
+            # accelerate dispatches modules across GPUs; do NOT call .to(device)
+            # afterwards (it would undo the dispatch). Inputs are placed on the
+            # input-embedding device; hidden states emerge on the last shard.
+            self.model = AutoModel.from_pretrained(
+                name, device_map=device_map, **model_kwargs
+            ).eval()
+            self._input_device = self.model.get_input_embeddings().weight.device
+            log.info(
+                "sharded embedder device_map=%s",
+                getattr(self.model, "hf_device_map", None),
+            )
+        else:
+            self.model = (
+                AutoModel.from_pretrained(name, **model_kwargs).to(device).eval()
+            )
+            self._input_device = torch.device(device)
+
+        self._eos_id: int | None = None
+        if self.add_eos:
+            self._eos_id = self.tokenizer.convert_tokens_to_ids("<|endoftext|>")
+            if self._eos_id is None or self._eos_id < 0:
+                self._eos_id = self.tokenizer.eos_token_id
 
         with torch.no_grad():
             test = self._encode_texts([self.passage_prefix + "test"])
@@ -73,26 +139,50 @@ class E5Embedder:
         return np.vstack(out)
 
     def _encode_texts(self, texts: list[str]) -> np.ndarray:
-        batch = self.tokenizer(
-            texts,
-            max_length=self.max_length,
-            padding=True,
-            truncation=True,
-            return_tensors="pt",
-        ).to(self.device)
-        outputs = self.model(**batch)
-        if self.pooling == "cls":
-            emb = outputs.last_hidden_state[:, 0, :]
+        if self.add_eos and self._eos_id is not None:
+            # Append <|endoftext|> to every sequence (reserve one slot for it),
+            # then pad. Matches the official Qwen3-Embedding tokenization.
+            batch = self.tokenizer(
+                texts,
+                max_length=self.max_length - 1,
+                padding=False,
+                truncation=True,
+            )
+            for ids, att in zip(batch["input_ids"], batch["attention_mask"]):
+                ids.append(self._eos_id)
+                att.append(1)
+            batch = self.tokenizer.pad(batch, padding=True, return_tensors="pt").to(
+                self._input_device
+            )
         else:
-            emb = _average_pool(outputs.last_hidden_state, batch["attention_mask"])
-        emb = torch.nn.functional.normalize(emb, p=2, dim=1)
+            batch = self.tokenizer(
+                texts,
+                max_length=self.max_length,
+                padding=True,
+                truncation=True,
+                return_tensors="pt",
+            ).to(self._input_device)
+        outputs = self.model(**batch)
+        # With device_map sharding, hidden states emerge on the last shard's
+        # device; align the mask to it so pooling never crosses devices.
+        hidden = outputs.last_hidden_state
+        mask = batch["attention_mask"].to(hidden.device)
+        if self.pooling == "cls":
+            emb = hidden[:, 0, :]
+        elif self.pooling == "last":
+            emb = _last_token_pool(hidden, mask)
+        else:
+            emb = _average_pool(hidden, mask)
+        emb = torch.nn.functional.normalize(emb.float(), p=2, dim=1)
         return emb.cpu().numpy().astype(np.float32)
 
     def count_truncated(self, texts: Iterable[str]) -> int:
         """Count how many passages exceed max_length tokens (including prefix)."""
         n = 0
         for t in texts:
-            ids = self.tokenizer.encode(self.passage_prefix + t, add_special_tokens=True)
+            ids = self.tokenizer.encode(
+                self.passage_prefix + t, add_special_tokens=True
+            )
             if len(ids) > self.max_length:
                 n += 1
         return n
@@ -104,3 +194,20 @@ def _average_pool(
     mask = attention_mask[..., None].bool()
     last = last_hidden_states.masked_fill(~mask, 0.0)
     return last.sum(dim=1) / attention_mask.sum(dim=1)[..., None].clamp(min=1)
+
+
+def _last_token_pool(
+    last_hidden_states: torch.Tensor, attention_mask: torch.Tensor
+) -> torch.Tensor:
+    """Take the hidden state of the last non-padding token.
+
+    Handles both left- and right-padded batches (official Qwen3-Embedding impl).
+    """
+    left_padding = attention_mask[:, -1].sum() == attention_mask.shape[0]
+    if left_padding:
+        return last_hidden_states[:, -1]
+    sequence_lengths = attention_mask.sum(dim=1) - 1
+    batch_size = last_hidden_states.shape[0]
+    return last_hidden_states[
+        torch.arange(batch_size, device=last_hidden_states.device), sequence_lengths
+    ]

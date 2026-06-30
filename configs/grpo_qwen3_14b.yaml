@@ -66,7 +66,7 @@ algorithm:
   # Group-relative, anchored tool-call penalty (Perplexity "Advancing
   # Search-Augmented Language Models"). For each group g, winners are rollouts
   # with reward == winner_threshold. A per-group baseline is sampled
-  # b_g ~ Unif[mean_{W_g} c, mean_{W_g} c + 1]; excess delta_i = max(0, c_i - b_g);
+  # b_g ~ Unif[min_{W_g} c, mean_{W_g} c]; excess delta_i = max(0, c_i - b_g);
   # p_i = 1 - exp(-delta_i); penalty = alpha_win*p_i for winners, else
   # alpha_lose*p_i + beta_lose. Penalty only applied when the per-group reward
   # std > std_threshold; empty winner set => no penalty. Subtracted from the
@@ -194,6 +194,11 @@ agent_loop:
     tool_timeout_s: 30
     max_turns: 12
     max_tool_calls: 16
+    # When true, suffix each tool response with `[calls used: N/max_tool_calls]`
+    # and, once the budget is spent, grant one final turn for the model to answer
+    # instead of cutting the rollout off. Mirror agent.tool_budget_feedback in the
+    # eval config so train and eval stay consistent.
+    tool_budget_feedback: false
     top_k_default: 5
     top_k_max: 50
     max_response_tokens: 5120
@@ -201,6 +206,11 @@ agent_loop:
     # instead of silently returning empty results and degrading rewards.
     # Set to 0 to disable (old behaviour).
     max_consecutive_tool_errors: 20
+    # Replace doc_ids with small per-rollout integers (0,1,2… by first
+    # appearance) in tool output; the model answers with ints and they are
+    # mapped back to doc_ids for reward/NDCG. Must match the eval harness'
+    # agent.use_id_map so train and eval stay consistent.
+    use_id_map: false
 
 trainer:
   project_name: agentic_retrieval_grpo

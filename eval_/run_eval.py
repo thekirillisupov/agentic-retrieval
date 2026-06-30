@@ -52,6 +52,8 @@ def run_agent_eval(
         temperature=cfg["model"].get("temperature", 0.6),
         top_k_default=cfg["index"].get("top_k_default", 10),
         top_k_max=cfg["index"].get("top_k_max", 50),
+        use_id_map=cfg["agent"].get("use_id_map", False),
+        tool_budget_feedback=cfg["agent"].get("tool_budget_feedback", False),
     )
 
     out_dir = Path(cfg["trajectories"]["output_dir"])

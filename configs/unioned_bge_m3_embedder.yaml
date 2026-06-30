@@ -1,9 +1,6 @@
 # SBOL + MuSiQue served as SEPARATE per-source indexes (no longer one merged
 # index), so a MuSiQue query can never retrieve SBOL/rnd passages and vice versa.
-# FAISS indexes run on CPU (faiss-gpu not available). Embedder is BGE-M3 (~568M
-# encoder) on a single GPU — small/fast enough to keep up under the colocated
-# 8-GPU GSPO trainer, unlike the 4B Qwen3-Embedding decoder which got
-# GPU-starved and timed out (every search hitting tool_timeout_s).
+# FAISS indexes run on CPU (faiss-gpu not available). Embedder uses GPU 0.
 #   GPUS=0 CONFIG=configs/unioned.yaml bash scripts/serve_tool.sh
 model:
   name: Qwen/Qwen3.5-35B-A3B
@@ -24,7 +21,6 @@ embedder:
   device: cuda:0
   batch_size: 32
   max_length: 8192
-  # BGE-M3 is an encoder with [CLS] pooling and no query/passage prefixes.
   query_prefix: ""
   passage_prefix: ""
   pooling: "cls"
@@ -45,7 +41,7 @@ index:
     sbol:
       dir: ./indexes/sbol/
     # Source key is "rnd" (matches data_source "rnd_retrieval" -> "rnd"); the
-    # FAISS index lives under indexes/rnd_index/.
+    # FAISS index lives under indexes/qwen3/rnd_index/.
     rnd:
       dir: ./indexes/rnd_index/
     ckr:
@@ -58,7 +54,7 @@ index:
 # across GPUs 0-3 (scripts/serve_tool.sh: GPUS=0,1,2,3). Fail-soft: a reranker
 # error degrades to the raw FAISS order rather than failing the search.
 reranker:
-  # Disabled for now — search is embedding-only (FAISS over BGE-M3).
+  # Disabled for now — search is embedding-only (FAISS over Qwen3-Embedding-4B).
   # Flip back to true (and start scripts/serve_reranker.sh) to re-enable the
   # second-stage cross-encoder rerank.
   enable: false

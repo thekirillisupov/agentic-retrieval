@@ -10,6 +10,26 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 
+def assign_serial_id(
+    doc_id: str, id_map: dict[str, int], id_map_inv: list[str]
+) -> int:
+    """Map a doc_id to a small per-episode integer, assigning on first sight.
+
+    Integers are handed out by order of first appearance (0, 1, 2, …) and are
+    stable within an episode: one doc_id always maps to the same int across
+    turns and stubs. The serialization layer uses this so the model exchanges
+    compact ints instead of long doc_id strings; the harness translates the
+    model's int answers back to doc_ids for scoring. ``id_map_inv[i]`` is the
+    doc_id for int ``i``; ``id_map`` is the reverse lookup.
+    """
+    idx = id_map.get(doc_id)
+    if idx is None:
+        idx = len(id_map_inv)
+        id_map[doc_id] = idx
+        id_map_inv.append(doc_id)
+    return idx
+
+
 @dataclass
 class Message:
     """A single chat message, OpenAI-style.
@@ -94,6 +114,9 @@ class Trajectory:
     stopped_reason: str
     num_turns: int
     num_tool_calls: int
+    # tool_budget_feedback diagnostic: tool calls emitted after the budget was
+    # already spent (each one ignored the "return <answer>" nudge).
+    num_over_budget_calls: int = 0
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0

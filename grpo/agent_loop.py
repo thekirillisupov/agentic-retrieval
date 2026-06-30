@@ -40,9 +40,17 @@ import json
 import logging
 import random
 import re
+import threading
 import time
 import uuid
 from typing import Any
+
+# One startup ping per Ray worker process. veRL instantiates a fresh
+# RetrievalReActAgentLoop for every rollout trajectory; without this guard
+# step-1 training would fire num_workers × batch_size concurrent /healthz
+# calls and can push the server past the client timeout.
+_tool_server_health_lock = threading.Lock()
+_tool_server_health_verified_url: str | None = None
 
 import httpx
 
@@ -111,11 +119,16 @@ except Exception:  # pragma: no cover - verl optional at import time
 
 from agent.parser import parse_answer
 from agent.prompts import (
+    apply_tool_response_truncation,
+    fit_grep_results_to_budget,
+    fit_search_display_to_budget,
     get_tool_schemas,
     render_grep_results,
     render_neighbours_results,
     render_search_results_json,
 )
+from agent.schemas import assign_serial_id
+from eval_.metrics import simple_recall
 
 log = logging.getLogger(__name__)
 
@@ -123,6 +136,30 @@ log = logging.getLogger(__name__)
 _QWEN_TOOL_CALL_RE = re.compile(
     r"<tool_call>\s*(?P<body>.*?)\s*</tool_call>", re.DOTALL
 )
+
+
+def _append_trajectory_doc_ids(
+    display: list[dict[str, Any]],
+    trajectory_doc_ids: list[str],
+    trajectory_doc_ids_seen: set[str],
+    id_map_inv: list[str] | None,
+) -> None:
+    """Record doc_ids shown in a tool response, in encounter order (deduped)."""
+    for item in display:
+        raw = item.get("doc_id")
+        if raw is None:
+            continue
+        if isinstance(raw, int):
+            if id_map_inv is None or not (0 <= raw < len(id_map_inv)):
+                continue
+            did = id_map_inv[raw]
+        else:
+            did = str(raw)
+            if not did:
+                continue
+        if did not in trajectory_doc_ids_seen:
+            trajectory_doc_ids.append(did)
+            trajectory_doc_ids_seen.add(did)
 
 
 def _parse_qwen_tool_calls(text: str) -> list[dict[str, Any]]:
@@ -153,7 +190,10 @@ def _parse_qwen_tool_calls(text: str) -> list[dict[str, Any]]:
                 {
                     "id": f"call_{uuid.uuid4().hex[:8]}",
                     "type": "function",
-                    "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(args, ensure_ascii=False),
+                    },
                 }
             )
             continue
@@ -165,7 +205,9 @@ def _parse_qwen_tool_calls(text: str) -> list[dict[str, Any]]:
                     "type": "function",
                     "function": {
                         "name": j.get("name", ""),
-                        "arguments": json.dumps(j.get("arguments", {}), ensure_ascii=False),
+                        "arguments": json.dumps(
+                            j.get("arguments", {}), ensure_ascii=False
+                        ),
                     },
                 }
             )
@@ -176,6 +218,21 @@ def _parse_qwen_tool_calls(text: str) -> list[dict[str, Any]]:
 
 def _strip_internal_keys(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [{k: v for k, v in m.items() if not k.startswith("_")} for m in messages]
+
+
+def _fitted_new_doc_ids(
+    candidate_new_ids: list[str],
+    fitted: list[dict[str, Any]],
+    id_map: dict[str, int] | None,
+) -> list[str]:
+    """Keep only new doc_ids whose full passage survived budget fitting."""
+    fitted_ids = {r["doc_id"] for r in fitted if "text" in r}
+    out: list[str] = []
+    for did in candidate_new_ids:
+        key: Any = id_map[did] if id_map is not None and did in id_map else did
+        if key in fitted_ids:
+            out.append(did)
+    return out
 
 
 @register("retrieval_react")
@@ -231,6 +288,13 @@ class RetrievalReActAgentLoop(AgentLoopBase):
         ).rstrip("/")
         self.tool_timeout_s = float(_g("tool_timeout_s", 60.0))
         self.max_tool_calls = int(_g("max_tool_calls", 10))
+        # When True, make the tool-call budget visible to the policy: every tool
+        # response is suffixed with `[calls used: N/max_tool_calls]`, and once the
+        # budget is spent the rollout is NOT cut short — the model is handed one
+        # final turn (with an explicit nudge) to emit its <answer>. When False the
+        # old behaviour stands: hitting the budget ends the rollout immediately
+        # with stopped_reason="max_tool_calls".
+        self.tool_budget_feedback: bool = bool(_g("tool_budget_feedback", False))
         self.top_k_default = int(_g("top_k_default", 10))
         self.top_k_max = int(_g("top_k_max", 50))
         # Comma-separated list of tool names to expose, e.g. "local_search" or
@@ -247,6 +311,11 @@ class RetrievalReActAgentLoop(AgentLoopBase):
         # is pinned to the row's corpus, so one question == one base. Flip to
         # True later to train the model to choose sources itself.
         self.allow_model_source: bool = bool(_g("allow_model_source", False))
+        # Serialization: when True, doc_ids are replaced with small per-rollout
+        # integers (0,1,2… by first appearance) in every tool output, the model
+        # answers with those integers, and they are translated back to doc_ids
+        # for reward/NDCG. Mirrors agent/harness.py so train and eval match.
+        self.use_id_map: bool = bool(_g("use_id_map", False))
         # After this many consecutive tool-server failures the worker triggers
         # a /reload on the server. Set to 0 to disable the circuit breaker.
         # Sized for ~128 agent workers: a single brownout (e.g. weight-update
@@ -271,15 +340,22 @@ class RetrievalReActAgentLoop(AgentLoopBase):
     def _check_tool_server_health(self) -> None:
         """Synchronous startup ping — raises RuntimeError if the server is unreachable.
 
-        128 rollout workers all call this at the same instant during training
-        startup, which would otherwise stampede the server's anyio threadpool
-        (default ~40) even though ``/healthz`` is now ``async def``. Retry on
-        transient connect/read timeouts with jittered backoff; only treat a
-        genuine 5xx/503 as a permanent failure.
+        Called once per Ray worker process (not once per rollout trajectory).
+        Retry on transient connect/read timeouts with jittered backoff; only
+        treat a genuine 5xx/503 as a permanent failure.
         """
-        import httpx as _httpx
+        global _tool_server_health_verified_url
 
         url = f"{self.tool_server_url}/healthz"
+        with _tool_server_health_lock:
+            if _tool_server_health_verified_url == url:
+                return
+            self._ping_tool_server_health(url)
+            _tool_server_health_verified_url = url
+
+    def _ping_tool_server_health(self, url: str) -> None:
+        import httpx as _httpx
+
         max_attempts = 5
         per_attempt_timeout = 30.0
         last_exc: Exception | None = None
@@ -376,6 +452,10 @@ class RetrievalReActAgentLoop(AgentLoopBase):
         arguments: dict[str, Any],
         pinned_source: str = "",
         seen: set[str] | None = None,
+        id_map: dict[str, int] | None = None,
+        id_map_inv: list[str] | None = None,
+        trajectory_doc_ids: list[str] | None = None,
+        trajectory_doc_ids_seen: set[str] | None = None,
     ) -> tuple[str, dict[str, Any]]:
         _SEARCH_NAMES = {"local_search", "search"}
 
@@ -398,15 +478,14 @@ class RetrievalReActAgentLoop(AgentLoopBase):
         else:
             source = pinned_source
 
+        search_rendered = False
         if name in _SEARCH_NAMES:
             query = str(arguments.get("query", "")).strip()
             # Over-fetch so that after deduplication against `seen` we still
             # return ~top_k new docs (mirrors agent/harness.py). Only meaningful
             # when dedup is active (seen is not None).
             fetch_k = (
-                min(top_k + len(seen), self.top_k_max)
-                if seen is not None
-                else top_k
+                min(top_k + len(seen), self.top_k_max) if seen is not None else top_k
             )
             body: dict[str, Any] = {"query": query, "top_k": fetch_k}
             if source:
@@ -431,24 +510,81 @@ class RetrievalReActAgentLoop(AgentLoopBase):
             # rank order until top_k NEW docs have been shown, then stop (any
             # trailing seen ids below the last new doc are dropped). Only NEW
             # docs are added to `seen`.
+            # `new_doc_ids` / `scored` keep REAL doc_ids (summary + seen tracking
+            # stay in doc_id space). Only the rendered `display` is serialized to
+            # ints when id_map is active.
+            scored: list[dict[str, Any]] = []
             if seen is not None:
                 display: list[dict[str, Any]] = []
                 new_doc_ids: list[str] = []
                 for r in results:
                     did = r["doc_id"]
                     if did in seen:
-                        display.append({"doc_id": did})
+                        stub: dict[str, Any] = {"doc_id": did}
+                        if id_map is not None and id_map_inv is not None:
+                            stub["doc_id"] = assign_serial_id(did, id_map, id_map_inv)
+                        display.append(stub)
                     else:
-                        display.append(r)
-                        seen.add(did)
                         new_doc_ids.append(did)
+                        if "score" in r:
+                            scored.append({"doc_id": did, "score": float(r["score"])})
+                        if id_map is not None and id_map_inv is not None:
+                            display.append(
+                                {
+                                    **r,
+                                    "doc_id": assign_serial_id(did, id_map, id_map_inv),
+                                }
+                            )
+                        else:
+                            display.append(r)
                         if len(new_doc_ids) >= top_k:
                             break
-                new_results = display
+                new_results, rendered = fit_search_display_to_budget(
+                    display,
+                    self.max_tool_response_length,
+                    self.tool_response_truncate_side,
+                )
+                if trajectory_doc_ids is not None and trajectory_doc_ids_seen is not None:
+                    _append_trajectory_doc_ids(
+                        new_results,
+                        trajectory_doc_ids,
+                        trajectory_doc_ids_seen,
+                        id_map_inv,
+                    )
+                fitted_new_ids = _fitted_new_doc_ids(new_doc_ids, new_results, id_map)
+                for did in fitted_new_ids:
+                    seen.add(did)
+                new_doc_ids = fitted_new_ids
+                scored = [s for s in scored if s["doc_id"] in set(fitted_new_ids)]
             else:
-                new_results = results
                 new_doc_ids = [r["doc_id"] for r in results]
-            rendered = render_search_results_json(new_results)
+                scored = [
+                    {"doc_id": r["doc_id"], "score": float(r["score"])}
+                    for r in results
+                    if "score" in r
+                ]
+                if id_map is not None and id_map_inv is not None:
+                    new_results = [
+                        {
+                            **r,
+                            "doc_id": assign_serial_id(r["doc_id"], id_map, id_map_inv),
+                        }
+                        for r in results
+                    ]
+                else:
+                    new_results = results
+                new_results, rendered = fit_search_display_to_budget(
+                    new_results,
+                    self.max_tool_response_length,
+                    self.tool_response_truncate_side,
+                )
+                if trajectory_doc_ids is not None and trajectory_doc_ids_seen is not None:
+                    _append_trajectory_doc_ids(
+                        new_results,
+                        trajectory_doc_ids,
+                        trajectory_doc_ids_seen,
+                        id_map_inv,
+                    )
             summary: dict[str, Any] = {
                 "num_results": len(new_results),
                 "num_new": len(new_doc_ids),
@@ -456,12 +592,9 @@ class RetrievalReActAgentLoop(AgentLoopBase):
                 # Only the newly-shown docs (full passages). Seen placeholders
                 # were already reported when first surfaced.
                 "top_doc_ids": new_doc_ids,
-                "doc_ids_with_scores": [
-                    {"doc_id": r["doc_id"], "score": float(r["score"])}
-                    for r in new_results
-                    if "score" in r
-                ],
+                "doc_ids_with_scores": scored,
             }
+            search_rendered = True
 
         elif name == "grep":
             pattern = str(arguments.get("pattern", "")).strip()
@@ -482,20 +615,67 @@ class RetrievalReActAgentLoop(AgentLoopBase):
             self._record_tool_success()
             results = payload.get("results", [])
             total_matches: int = payload.get("total_matches", len(results))
-            rendered = render_grep_results(results, total_matches)
-            summary = {
-                "num_results": len(results),
-                "total_matches": total_matches,
-                "top_doc_ids": [r["doc_id"] for r in results],
+            if id_map is not None and id_map_inv is not None:
+                grep_display = [
+                    {**r, "doc_id": assign_serial_id(r["doc_id"], id_map, id_map_inv)}
+                    for r in results
+                ]
+            else:
+                grep_display = results
+            # Map each rendered entry back to its REAL doc_id (grep_display may
+            # hold serial ints). Identity-keyed so it survives front/back drops.
+            real_by_obj = {
+                id(disp): r["doc_id"] for disp, r in zip(grep_display, results)
             }
+            # Fit to budget BEFORE marking docs seen: a hit truncated out of the
+            # response must not become citeable (see run loop seen-tracking).
+            fitted_display, rendered = fit_grep_results_to_budget(
+                grep_display,
+                total_matches,
+                self.max_tool_response_length,
+                self.tool_response_truncate_side,
+            )
+            if trajectory_doc_ids is not None and trajectory_doc_ids_seen is not None:
+                _append_trajectory_doc_ids(
+                    fitted_display,
+                    trajectory_doc_ids,
+                    trajectory_doc_ids_seen,
+                    id_map_inv,
+                )
+            fitted_doc_ids = [real_by_obj[id(disp)] for disp in fitted_display]
+            summary = {
+                "num_results": len(fitted_display),
+                "total_matches": total_matches,
+                "top_doc_ids": fitted_doc_ids,
+            }
+            search_rendered = True
 
         else:  # get_neighbours
-            doc_id_arg = str(arguments.get("doc_id", "")).strip()
+            doc_id_arg_raw = str(arguments.get("doc_id", "")).strip()
             try:
                 window = int(arguments.get("window", 1))
             except (TypeError, ValueError):
                 window = 1
             window = max(1, min(window, 10))
+
+            # When id_map is active the model passes a serial integer; decode to
+            # the real doc_id before hitting the tool server. Keep the original
+            # int string for error/no-op messages shown back to the model.
+            if id_map is not None and id_map_inv is not None:
+                try:
+                    _idx = int(doc_id_arg_raw)
+                    doc_id_arg = (
+                        id_map_inv[_idx]
+                        if 0 <= _idx < len(id_map_inv)
+                        else doc_id_arg_raw
+                    )
+                except ValueError:
+                    doc_id_arg = doc_id_arg_raw
+                anchor_display: Any = doc_id_arg_raw
+            else:
+                doc_id_arg = doc_id_arg_raw
+                anchor_display = doc_id_arg_raw
+
             nb_body: dict[str, Any] = {"doc_id": doc_id_arg, "window": window}
             if source:
                 nb_body["source"] = source
@@ -513,21 +693,35 @@ class RetrievalReActAgentLoop(AgentLoopBase):
             self._record_tool_success()
             results = payload.get("results", [])
             status = str(payload.get("status", "ok"))
-            rendered = render_neighbours_results(results, status, doc_id_arg, window)
+            if id_map is not None and id_map_inv is not None:
+                nb_display = [
+                    {**r, "doc_id": assign_serial_id(r["doc_id"], id_map, id_map_inv)}
+                    for r in results
+                ]
+            else:
+                nb_display = results
+            if trajectory_doc_ids is not None and trajectory_doc_ids_seen is not None:
+                _append_trajectory_doc_ids(
+                    nb_display,
+                    trajectory_doc_ids,
+                    trajectory_doc_ids_seen,
+                    id_map_inv,
+                )
+            rendered = render_neighbours_results(
+                nb_display, status, anchor_display, window
+            )
             summary = {
                 "num_results": len(results),
                 "status": status,
                 "top_doc_ids": [r["doc_id"] for r in results],
             }
 
-        if len(rendered) > self.max_tool_response_length:
-            if self.tool_response_truncate_side == "left":
-                rendered = rendered[: self.max_tool_response_length] + "...(truncated)"
-            elif self.tool_response_truncate_side == "right":
-                rendered = "(truncated)..." + rendered[-self.max_tool_response_length :]
-            else:
-                half = self.max_tool_response_length // 2
-                rendered = rendered[:half] + "...(truncated)..." + rendered[-half:]
+        if not search_rendered and len(rendered) > self.max_tool_response_length:
+            rendered = apply_tool_response_truncation(
+                rendered,
+                self.max_tool_response_length,
+                self.tool_response_truncate_side,
+            )
 
         return rendered, summary
 
@@ -559,7 +753,7 @@ class RetrievalReActAgentLoop(AgentLoopBase):
             row_source = ds
         if not row_source:
             row_source = self.default_source
-        _tool_schemas = get_tool_schemas(prompt_version)
+        _tool_schemas = get_tool_schemas(prompt_version, use_id_map=self.use_id_map)
         if self.tool_names:
             filtered = [
                 s
@@ -575,11 +769,23 @@ class RetrievalReActAgentLoop(AgentLoopBase):
         response_mask: list[int] = []
 
         seen: set[str] = set()
+        # Per-rollout doc_id <-> serial int maps (only used when use_id_map).
+        id_map: dict[str, int] = {}
+        id_map_inv: list[str] = []
+        trajectory_doc_ids: list[str] = []
+        trajectory_doc_ids_seen: set[str] = set()
         ranked_doc_ids: list[str] = []
         stopped_reason = "max_turns"
         num_tool_calls = 0
+        # tool_budget_feedback diagnostics: how many tool calls the model emitted
+        # *after* the budget was already spent (each one gets a stub nudge). High
+        # values mean the model keeps ignoring the "return <answer>" nudge.
+        num_over_budget_calls = 0
         num_assistant_turns = 0
         tool_call_traces: list[dict[str, Any]] = []
+        # tool_budget_feedback: ensures the post-budget "final answer" turn is
+        # granted exactly once, so a model that keeps calling tools can't spin.
+        final_answer_chance_used = False
 
         for _turn in range(self.max_assistant_turns):
             num_assistant_turns += 1
@@ -605,9 +811,25 @@ class RetrievalReActAgentLoop(AgentLoopBase):
                 else:
                     # Deduplicate by first occurrence so the model cannot game
                     # NDCG/recall by repeating the same doc_id multiple times.
+                    # When id_map is active the model emits serial ints; translate
+                    # back to real doc_ids before the seen-filter and scoring.
                     _seen_ans: set[str] = set()
                     ranked_doc_ids = []
-                    for _d in answer:
+                    for _tok in answer:
+                        if self.use_id_map:
+                            try:
+                                _idx = int(_tok)
+                                _d = (
+                                    id_map_inv[_idx]
+                                    if 0 <= _idx < len(id_map_inv)
+                                    else None
+                                )
+                            except (ValueError, IndexError):
+                                _d = None
+                            if _d is None:
+                                continue
+                        else:
+                            _d = _tok
                         if _d in seen and _d not in _seen_ans:
                             ranked_doc_ids.append(_d)
                             _seen_ans.add(_d)
@@ -624,15 +846,52 @@ class RetrievalReActAgentLoop(AgentLoopBase):
                 for tc in tool_calls:
                     if num_tool_calls >= self.max_tool_calls:
                         budget_exhausted = True
-                        break
+                        if not self.tool_budget_feedback:
+                            break
+                        num_over_budget_calls += 1
+                        # Feedback mode: every emitted tool_call must still get a
+                        # tool response or the chat template (and downstream
+                        # trace) is malformed. Answer over-budget calls with an
+                        # explicit stub that nudges the model to stop calling
+                        # tools and emit its <answer> on the next turn.
+                        new_tool_messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc["id"],
+                                "content": json.dumps(
+                                    {
+                                        "error": "tool_budget_exhausted",
+                                        "instruction": (
+                                            "You have used all tool calls. Do not "
+                                            "call any more tools. Return your final "
+                                            "<answer> now."
+                                        ),
+                                    }
+                                )
+                                + f"\n[calls used: {num_tool_calls}/{self.max_tool_calls}]",
+                            }
+                        )
+                        continue
                     try:
                         args = json.loads(tc["function"]["arguments"]) or {}
                     except json.JSONDecodeError:
                         args = {}
                     rendered, summary = await self._call_tool(
-                        tc["function"]["name"], args, pinned_source=row_source, seen=seen
+                        tc["function"]["name"],
+                        args,
+                        pinned_source=row_source,
+                        seen=seen,
+                        id_map=id_map if self.use_id_map else None,
+                        id_map_inv=id_map_inv if self.use_id_map else None,
+                        trajectory_doc_ids=trajectory_doc_ids,
+                        trajectory_doc_ids_seen=trajectory_doc_ids_seen,
                     )
                     num_tool_calls += 1
+                    if self.tool_budget_feedback:
+                        rendered = (
+                            f"{rendered}\n[calls used: "
+                            f"{num_tool_calls}/{self.max_tool_calls}]"
+                        )
 
                     # For non-search tools (grep, get_neighbours) `seen` is not
                     # updated inside _call_tool, so we still track them here.
@@ -654,6 +913,19 @@ class RetrievalReActAgentLoop(AgentLoopBase):
                         }
                     )
 
+            # Grant a one-shot "final answer" turn when the budget was just
+            # spent. The over-budget tool stubs (which carry the
+            # `[calls used: N/max]` marker) already tell the model it is out of
+            # tool calls, so the trajectory simply continues into one more
+            # assistant turn for the model to emit its <answer>.
+            grant_final_answer = (
+                budget_exhausted
+                and self.tool_budget_feedback
+                and not final_answer_chance_used
+            )
+            if grant_final_answer:
+                final_answer_chance_used = True
+
             messages.extend(new_tool_messages)
 
             if new_tool_messages:
@@ -663,7 +935,7 @@ class RetrievalReActAgentLoop(AgentLoopBase):
                 running_ids = running_ids + list(tool_ids)
                 response_mask.extend([0] * len(tool_ids))
 
-            if budget_exhausted:
+            if budget_exhausted and not grant_final_answer:
                 stopped_reason = "max_tool_calls"
                 break
             if len(response_mask) >= self.response_length:
@@ -681,15 +953,30 @@ class RetrievalReActAgentLoop(AgentLoopBase):
             num_preempted=int(metrics.get("num_preempted", -1)),
         )
 
+        gold_doc_ids = list(extra_info.get("gold_doc_ids", []))
+        trajectories_recall = (
+            simple_recall(trajectory_doc_ids, set(gold_doc_ids)) if gold_doc_ids else 0.0
+        )
+        if self.use_id_map:
+            trajectories_ids = [id_map[did] for did in trajectory_doc_ids]
+        else:
+            trajectories_ids = list(trajectory_doc_ids)
         extra_fields = {
             "ranked_doc_ids": ranked_doc_ids,
-            "gold_doc_ids": list(extra_info.get("gold_doc_ids", [])),
+            "gold_doc_ids": gold_doc_ids,
+            "trajectories_recall": trajectories_recall,
+            "trajectories_ids": trajectories_ids,
             "stopped_reason": stopped_reason,
             "num_tool_calls": num_tool_calls,
+            "num_over_budget_calls": num_over_budget_calls,
             "tool_call_traces": tool_call_traces,
             "messages_full": _strip_internal_keys(messages),
             "response_len": len(response_mask),
         }
+        if self.use_id_map:
+            extra_fields["gold_ids_mapped"] = [
+                id_map[gid] if gid in id_map else None for gid in gold_doc_ids
+            ]
 
         return AgentLoopOutput(
             prompt_ids=prompt_ids,
