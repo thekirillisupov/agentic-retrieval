@@ -13,7 +13,7 @@ set -euo pipefail
 MODEL="${MODEL:-Qwen/Qwen3.5-35B-A3B}"
 PORT="${PORT:-8000}"
 TP="${TP:-2}"
-MAX_LEN="${MAX_LEN:-32768}"
+MAX_LEN="${MAX_LEN:-65536}"
 GPUS="${GPUS:-0,1}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-32}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.60}"

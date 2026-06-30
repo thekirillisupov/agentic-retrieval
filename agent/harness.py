@@ -30,6 +30,7 @@ from agent.schemas import (
     StoppedReason,
     ToolCallTrace,
     Trajectory,
+    assign_serial_id,
 )
 
 log = logging.getLogger(__name__)
@@ -93,6 +94,8 @@ class AgentHarness:
         temperature: float = 0.6,
         top_k_default: int = 10,
         top_k_max: int = 50,
+        use_id_map: bool = False,
+        tool_budget_feedback: bool = False,
     ) -> None:
         self.model = model
         self.client = OpenAI(base_url=vllm_url, api_key=api_key)
@@ -102,6 +105,13 @@ class AgentHarness:
         self.temperature = temperature
         self.top_k_default = top_k_default
         self.top_k_max = top_k_max
+        self.use_id_map = use_id_map
+        # Mirror of the training agent_loop knob (configs.agent_loop.retrieval_react
+        # .tool_budget_feedback). When True, suffix each tool response with
+        # `[calls used: N/max_tool_calls]` and, once the budget is spent, grant one
+        # final turn for the model to answer instead of stopping immediately. Must
+        # match training so eval trajectories match what the policy was trained on.
+        self.tool_budget_feedback = tool_budget_feedback
 
     def run(
         self,
@@ -112,6 +122,15 @@ class AgentHarness:
     ) -> AgentOutput:
         pv = prompt_version or self.prompt_version
         system_prompt = get_prompt(pv)
+
+        # Serialization: when enabled, doc_ids are replaced with small integers
+        # throughout the episode. This is a harness-level switch (config-driven),
+        # independent of the prompt version.
+        _use_id_map = self.use_id_map
+        # id_map_inv[i] == real doc_id for serial int i; id_map is the reverse.
+        # Populated lazily by assign_serial_id; only consulted when _use_id_map is True.
+        id_map: dict[str, int] = {}
+        id_map_inv: list[str] = []
 
         # The harness owns the system message; caller passes only the conversation.
         # Apply prompt-version-specific user content formatting (e.g. <client> wrap).
@@ -137,13 +156,19 @@ class AgentHarness:
         stopped_reason: StoppedReason = "max_turns"
         ranked_doc_ids: list[str] = []
         num_tool_calls = 0
+        # tool_budget_feedback diagnostic: tool calls emitted after the budget was
+        # spent (each gets a stub nudge). Mirrors agent_loop's counter.
+        num_over_budget_calls = 0
         turn = 0
+        # tool_budget_feedback: grant the post-budget "final answer" turn exactly
+        # once so a model that keeps calling tools can't spin (mirrors agent_loop).
+        final_answer_chance_used = False
 
         for turn in range(1, agent_input.max_turns + 1):
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[m.to_openai() for m in messages],
-                tools=get_tool_schemas(pv),
+                tools=get_tool_schemas(pv, use_id_map=_use_id_map),
                 tool_choice="auto",
                 max_tokens=self.max_tokens,
                 temperature=self.temperature,
@@ -183,19 +208,60 @@ class AgentHarness:
                 for tc in assistant_msg.tool_calls:
                     if num_tool_calls >= agent_input.max_tool_calls:
                         budget_exhausted = True
-                        break
+                        if not self.tool_budget_feedback:
+                            break
+                        num_over_budget_calls += 1
+                        # Feedback mode: answer over-budget calls with an explicit
+                        # stub that nudges the model to stop calling tools and emit
+                        # its <answer> on the next turn (mirrors agent_loop).
+                        messages.append(
+                            Message(
+                                role="tool",
+                                tool_call_id=tc.id,
+                                content=json.dumps(
+                                    {
+                                        "error": "tool_budget_exhausted",
+                                        "instruction": (
+                                            "You have used all tool calls. Do not "
+                                            "call any more tools. Return your final "
+                                            "<answer> now."
+                                        ),
+                                    }
+                                )
+                                + f"\n[calls used: {num_tool_calls}/{agent_input.max_tool_calls}]",
+                            )
+                        )
+                        continue
                     tool_msg, trace = self._execute_tool_call(
                         tc,
                         turn,
                         seen,
                         agent_input.top_k_default,
                         agent_input.source,
+                        id_map=id_map if _use_id_map else None,
+                        id_map_inv=id_map_inv if _use_id_map else None,
                     )
+                    num_tool_calls += 1
+                    if self.tool_budget_feedback:
+                        tool_msg.content = (
+                            f"{tool_msg.content}\n[calls used: "
+                            f"{num_tool_calls}/{agent_input.max_tool_calls}]"
+                        )
                     messages.append(tool_msg)
                     tool_call_traces.append(trace)
-                    num_tool_calls += 1
 
-                if budget_exhausted:
+                # One-shot "final answer" turn once the budget is spent: the
+                # over-budget stubs already tell the model it is out of tool
+                # calls, so the loop just continues into one more assistant turn.
+                grant_final_answer = (
+                    budget_exhausted
+                    and self.tool_budget_feedback
+                    and not final_answer_chance_used
+                )
+                if grant_final_answer:
+                    final_answer_chance_used = True
+
+                if budget_exhausted and not grant_final_answer:
                     stopped_reason = "max_tool_calls"
                     break
                 continue
@@ -211,7 +277,20 @@ class AgentHarness:
             # by repeating the same doc_id multiple times.
             valid: list[str] = []
             seen_in_answer: set[str] = set()
-            for doc_id in answer:
+            for token in answer:
+                if _use_id_map:
+                    # Model emits integer ids; translate back to real doc_ids.
+                    try:
+                        idx = int(token)
+                        doc_id = id_map_inv[idx] if 0 <= idx < len(id_map_inv) else None
+                    except (ValueError, IndexError):
+                        doc_id = None
+                    if doc_id is None:
+                        log.warning("Unknown serial id in answer, dropping: %s", token)
+                        continue
+                else:
+                    doc_id = token
+
                 if doc_id not in seen:
                     log.warning("Hallucinated doc_id in answer, dropping: %s", doc_id)
                 elif doc_id in seen_in_answer:
@@ -239,6 +318,7 @@ class AgentHarness:
             stopped_reason=stopped_reason,
             num_turns=turn,
             num_tool_calls=num_tool_calls,
+            num_over_budget_calls=num_over_budget_calls,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
@@ -259,6 +339,8 @@ class AgentHarness:
         seen: dict[str, SeenPassage],
         top_k_default: int,
         pinned_source: str | None = None,
+        id_map: dict[str, int] | None = None,
+        id_map_inv: list[str] | None = None,
     ) -> tuple[Message, ToolCallTrace]:
         name = tc.function.name
         try:
@@ -326,7 +408,10 @@ class AgentHarness:
                 score = float(r["score"])
                 if doc_id in seen:
                     seen[doc_id].update(score)
-                    display.append({"doc_id": doc_id})
+                    stub: dict[str, Any] = {"doc_id": doc_id}
+                    if id_map is not None and id_map_inv is not None:
+                        stub["doc_id"] = assign_serial_id(doc_id, id_map, id_map_inv)
+                    display.append(stub)
                 else:
                     seen[doc_id] = SeenPassage(
                         doc_id=doc_id,
@@ -335,7 +420,11 @@ class AgentHarness:
                         best_score=score,
                         first_seen_turn=turn,
                     )
-                    display.append(r)
+                    if id_map is not None and id_map_inv is not None:
+                        serial = assign_serial_id(doc_id, id_map, id_map_inv)
+                        display.append({**r, "doc_id": serial})
+                    else:
+                        display.append(r)
                     new_doc_ids.append(doc_id)
                     if len(new_doc_ids) >= top_k:
                         break
@@ -383,7 +472,14 @@ class AgentHarness:
                         best_score=1.0,
                         first_seen_turn=turn,
                     )
-            rendered = render_grep_results(results, total_matches)
+            if id_map is not None and id_map_inv is not None:
+                results_display = [
+                    {**r, "doc_id": assign_serial_id(r["doc_id"], id_map, id_map_inv)}
+                    for r in results
+                ]
+            else:
+                results_display = results
+            rendered = render_grep_results(results_display, total_matches)
             summary = {
                 "num_results": len(results),
                 "total_matches": total_matches,
@@ -391,9 +487,26 @@ class AgentHarness:
             }
 
         else:  # get_neighbours
-            doc_id_arg = str(args.get("doc_id", "")).strip()
+            doc_id_arg_raw = str(args.get("doc_id", "")).strip()
             window = int(args.get("window", 1))
             window = max(1, min(window, 10))
+
+            # When id_map is active the model passes a serial integer; decode to
+            # the real doc_id before hitting the tool server.
+            if id_map is not None and id_map_inv is not None:
+                try:
+                    idx = int(doc_id_arg_raw)
+                    doc_id_arg = (
+                        id_map_inv[idx] if 0 <= idx < len(id_map_inv) else doc_id_arg_raw
+                    )
+                except ValueError:
+                    doc_id_arg = doc_id_arg_raw
+                # Keep the original int string for error messages shown to the model.
+                anchor_display: Any = doc_id_arg_raw
+            else:
+                doc_id_arg = doc_id_arg_raw
+                anchor_display = doc_id_arg_raw
+
             try:
                 response = self.tool_client.get_neighbours(
                     doc_id=doc_id_arg, window=window, source=source
@@ -427,8 +540,15 @@ class AgentHarness:
                         best_score=0.0,
                         first_seen_turn=turn,
                     )
+            if id_map is not None and id_map_inv is not None:
+                results_for_render = [
+                    {**r, "doc_id": assign_serial_id(r["doc_id"], id_map, id_map_inv)}
+                    for r in results
+                ]
+            else:
+                results_for_render = results
             rendered = render_neighbours_results(
-                results, status, doc_id_arg, window
+                results_for_render, status, anchor_display, window
             )
             summary = {
                 "num_results": len(results),

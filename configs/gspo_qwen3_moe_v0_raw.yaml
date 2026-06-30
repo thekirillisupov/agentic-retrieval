@@ -1,0 +1,956 @@
+{
+  "data": {
+    "value": {
+      "seed": null,
+      "datagen": {
+        "name": null,
+        "path": null
+      },
+      "sampler": {
+        "class_name": null,
+        "class_path": null
+      },
+      "shuffle": true,
+      "use_shm": false,
+      "image_key": "images",
+      "tokenizer": null,
+      "val_files": "data/processed/unioned/grpo_val.parquet",
+      "video_key": "videos",
+      "custom_cls": {
+        "name": null,
+        "path": null
+      },
+      "prompt_key": "prompt",
+      "truncation": "error",
+      "train_files": "data/processed/unioned/grpo_train.parquet",
+      "reward_fn_key": "data_source",
+      "val_batch_size": 64,
+      "return_raw_chat": true,
+      "val_max_samples": -1,
+      "image_patch_size": 14,
+      "tool_config_path": null,
+      "train_batch_size": 64,
+      "max_prompt_length": 512,
+      "train_max_samples": -1,
+      "trust_remote_code": false,
+      "return_full_prompt": false,
+      "validation_shuffle": false,
+      "max_response_length": 512,
+      "return_raw_input_ids": false,
+      "dataloader_num_workers": 8,
+      "filter_overlong_prompts": false,
+      "return_multi_modal_inputs": true,
+      "apply_chat_template_kwargs": {
+        "enable_thinking": false
+      },
+      "filter_overlong_prompts_workers": 1
+    }
+  },
+  "index": {
+    "value": {
+      "grep_timeout_s": 15,
+      "reload_cooldown_s": 30,
+      "grep_max_text_chars": 4096,
+      "grep_max_concurrency": 4
+    }
+  },
+  "_wandb": {
+    "value": {
+      "m": [],
+      "t": {
+        "1": [
+          1,
+          5,
+          11,
+          30,
+          41,
+          49,
+          50,
+          51,
+          53,
+          71,
+          95,
+          98,
+          105
+        ],
+        "2": [
+          1,
+          5,
+          11,
+          30,
+          41,
+          49,
+          50,
+          51,
+          53,
+          71,
+          95,
+          98,
+          105
+        ],
+        "3": [
+          13,
+          16,
+          61
+        ],
+        "4": "3.12.13",
+        "5": "0.26.1",
+        "6": "5.6.0",
+        "8": [
+          2
+        ],
+        "12": "0.26.1",
+        "13": "linux-x86_64"
+      },
+      "cli_version": "0.26.1",
+      "python_version": "3.12.13"
+    }
+  },
+  "critic": {
+    "value": {
+      "model": {
+        "lora": {
+          "rank": 0,
+          "type": "lora",
+          "alpha": 32,
+          "dtype": null,
+          "dropout": 0,
+          "adapter_path": null,
+          "target_modules": [
+            "linear_qkv",
+            "linear_proj",
+            "linear_fc1",
+            "linear_fc2"
+          ],
+          "exclude_modules": [],
+          "a2a_experimental": false,
+          "dropout_position": "pre",
+          "lora_A_init_method": "xavier",
+          "lora_B_init_method": "zero",
+          "freeze_vision_model": true,
+          "freeze_language_model": true,
+          "freeze_vision_projection": true
+        },
+        "path": "~/models/deepseek-llm-7b-chat",
+        "_target_": "verl.trainer.config.BaseModelConfig",
+        "external_lib": null,
+        "tokenizer_path": "Qwen/Qwen3.5-35B-A3B",
+        "override_config": {
+          "moe_config": {
+            "freeze_moe_router": false
+          }
+        },
+        "trust_remote_code": true
+      },
+      "optim": {
+        "lr": 0.00001,
+        "betas": [
+          0.9,
+          0.999
+        ],
+        "min_lr": 0,
+        "_target_": "verl.workers.config.McoreOptimizerConfig",
+        "clip_grad": 1,
+        "optimizer": "adam",
+        "weight_decay": 0.01,
+        "lr_decay_steps": null,
+        "lr_decay_style": "constant",
+        "lr_warmup_init": 0,
+        "lr_warmup_steps": -1,
+        "lr_wsd_decay_steps": null,
+        "lr_wsd_decay_style": "exponential",
+        "total_training_steps": 257,
+        "lr_warmup_steps_ratio": 0,
+        "weight_decay_incr_style": "constant",
+        "use_checkpoint_opt_param_scheduler": false
+      },
+      "enable": null,
+      "shuffle": false,
+      "_target_": "verl.workers.config.McoreCriticConfig",
+      "megatron": {
+        "seed": 42,
+        "dtype": "bfloat16",
+        "_target_": "verl.workers.config.McoreEngineConfig",
+        "use_mbridge": true,
+        "forward_only": false,
+        "grad_offload": false,
+        "param_offload": false,
+        "router_replay": {
+          "mode": "disabled",
+          "_target_": "verl.workers.config.EngineRouterReplayConfig",
+          "record_file": null,
+          "replay_file": null
+        },
+        "vanilla_mbridge": true,
+        "optimizer_offload": false,
+        "sequence_parallel": true,
+        "use_remove_padding": true,
+        "context_parallel_size": 1,
+        "use_dist_checkpointing": false,
+        "dist_checkpointing_path": null,
+        "dist_checkpointing_prefix": "",
+        "use_distributed_optimizer": true,
+        "expert_model_parallel_size": 1,
+        "tensor_model_parallel_size": 1,
+        "expert_tensor_parallel_size": null,
+        "override_transformer_config": {
+          "recompute_method": null,
+          "attention_backend": "flash",
+          "recompute_modules": [
+            "core_attn"
+          ],
+          "recompute_num_layers": null,
+          "recompute_granularity": null
+        },
+        "pipeline_model_parallel_size": 1,
+        "dist_ckpt_optim_fully_reshardable": true,
+        "virtual_pipeline_model_parallel_size": null,
+        "distrib_optim_fully_reshardable_mem_efficient": false
+      },
+      "profiler": {
+        "tool": null,
+        "ranks": [],
+        "enable": false,
+        "_target_": "verl.utils.profiler.ProfilerConfig",
+        "all_ranks": false,
+        "save_path": "outputs/profile",
+        "tool_config": {
+          "npu": {
+            "level": "level0",
+            "_target_": "verl.utils.profiler.config.NPUToolConfig",
+            "analysis": true,
+            "contents": [],
+            "discrete": false
+          },
+          "nsys": {
+            "_target_": "verl.utils.profiler.config.NsightToolConfig",
+            "discrete": false
+          },
+          "torch": {
+            "_target_": "verl.utils.profiler.config.TorchProfilerToolConfig",
+            "contents": [],
+            "discrete": false
+          },
+          "torch_memory": {
+            "_target_": "verl.utils.profiler.config.TorchMemoryToolConfig",
+            "stack_depth": 32,
+            "trace_alloc_max_entries": 100000
+          }
+        }
+      },
+      "strategy": "megatron",
+      "rollout_n": 8,
+      "checkpoint": {
+        "_target_": "verl.trainer.config.CheckpointConfig",
+        "async_save": false,
+        "load_contents": [
+          "model",
+          "optimizer",
+          "extra"
+        ],
+        "save_contents": [
+          "model",
+          "optimizer",
+          "extra"
+        ]
+      },
+      "ppo_epochs": 1,
+      "load_weight": true,
+      "nccl_timeout": 600,
+      "loss_agg_mode": "seq-mean-token-mean",
+      "cliprange_value": 0.5,
+      "use_dynamic_bsz": false,
+      "data_loader_seed": 42,
+      "ppo_mini_batch_size": 32,
+      "ppo_micro_batch_size": null,
+      "ppo_max_token_len_per_gpu": 32768,
+      "ppo_micro_batch_size_per_gpu": null,
+      "forward_max_token_len_per_gpu": 32768
+    }
+  },
+  "reward": {
+    "value": {
+      "num_workers": 8,
+      "reward_model": {
+        "enable": false,
+        "nnodes": 1,
+        "rollout": {
+          "name": "???",
+          "dtype": "bfloat16",
+          "_target_": "verl.workers.config.RolloutConfig",
+          "load_format": "auto",
+          "limit_images": null,
+          "max_num_seqs": 1024,
+          "enforce_eager": true,
+          "max_model_len": null,
+          "prompt_length": 2048,
+          "response_length": 2048,
+          "disable_log_stats": true,
+          "free_cache_engine": true,
+          "data_parallel_size": 1,
+          "skip_tokenizer_init": false,
+          "expert_parallel_size": 1,
+          "enable_prefix_caching": true,
+          "enable_chunked_prefill": true,
+          "gpu_memory_utilization": 0.5,
+          "max_num_batched_tokens": 8192,
+          "cudagraph_capture_sizes": null,
+          "tensor_model_parallel_size": 2
+        },
+        "model_path": null,
+        "n_gpus_per_node": 8,
+        "enable_resource_pool": false
+      },
+      "reward_manager": {
+        "name": "naive",
+        "module": {
+          "name": "custom_reward_manager",
+          "path": null,
+          "_target_": "verl.trainer.config.config.ModuleConfig"
+        },
+        "source": "register",
+        "_target_": "verl.workers.config.reward_model.RewardManagerConfig"
+      },
+      "sandbox_fusion": {
+        "url": null,
+        "max_concurrent": 64,
+        "memory_limit_mb": 1024
+      },
+      "custom_reward_function": {
+        "name": "compute_score",
+        "path": "grpo/reward.py",
+        "reward_kwargs": {
+          "alpha": 1,
+          "f_beta": 4,
+          "ndcg_k": 5,
+          "answer_bonus": 0,
+          "length_alpha": 0,
+          "parse_error_penalty": 0,
+          "length_target_tokens": 8192
+        }
+      }
+    }
+  },
+  "trainer": {
+    "value": {
+      "device": "cuda",
+      "logger": [
+        "console",
+        "wandb"
+      ],
+      "nnodes": 1,
+      "save_freq": 10,
+      "test_freq": 5,
+      "resume_mode": "auto",
+      "project_name": "agentic_retrieval_gspo",
+      "total_epochs": 1,
+      "balance_batch": true,
+      "critic_warmup": 0,
+      "experiment_name": "qwen3_moe_a3b_musique",
+      "n_gpus_per_node": 8,
+      "default_hdfs_dir": null,
+      "resume_from_path": null,
+      "rollout_data_dir": null,
+      "val_before_train": true,
+      "default_local_dir": "checkpoints/gspo_qwen3_moe/",
+      "esi_redundant_time": 0,
+      "val_trajectory_dir": "trajectories_data/gspo_qwen3_moe",
+      "log_val_generations": 0,
+      "total_training_steps": null,
+      "max_actor_ckpt_to_keep": 1,
+      "use_legacy_worker_impl": "auto",
+      "max_critic_ckpt_to_keep": null,
+      "del_local_ckpt_after_load": false,
+      "ray_wait_register_center_timeout": 300
+    }
+  },
+  "algorithm": {
+    "value": {
+      "lam": 1,
+      "gamma": 1,
+      "pf_ppo": {
+        "weight_pow": 2,
+        "reweight_method": "pow"
+      },
+      "kl_coef": 0.01,
+      "kl_ctrl": {
+        "type": "fixed",
+        "horizon": 10000,
+        "kl_coef": 0.001,
+        "_target_": "verl.trainer.config.KLControlConfig",
+        "target_kl": 0.1
+      },
+      "_target_": "verl.trainer.config.AlgoConfig",
+      "kl_penalty": "kl",
+      "use_pf_ppo": false,
+      "tool_penalty": {
+        "enable": false,
+        "alpha_win": 0,
+        "beta_lose": 0,
+        "alpha_lose": 0,
+        "std_threshold": 0,
+        "winner_threshold": 1
+      },
+      "adv_estimator": "grpo",
+      "filter_groups": {
+        "enable": true,
+        "metric": "score",
+        "max_num_gen_batches": 0
+      },
+      "use_kl_in_reward": true,
+      "answer_doc_penalty": {
+        "enable": false,
+        "alpha_win": 0,
+        "beta_lose": 0,
+        "alpha_lose": 0,
+        "std_threshold": 0,
+        "winner_threshold": 1
+      },
+      "rollout_correction": {
+        "loss_type": "ppo_clip",
+        "rollout_is": null,
+        "rollout_rs": null,
+        "bypass_mode": false,
+        "rollout_is_threshold": 2,
+        "rollout_rs_threshold": null,
+        "rollout_is_batch_normalize": false
+      },
+      "norm_adv_by_std_in_grpo": true
+    }
+  },
+  "agent_loop": {
+    "value": {
+      "retrieval_react": {
+        "max_turns": 12,
+        "top_k_max": 50,
+        "tool_names": "",
+        "use_id_map": false,
+        "top_k_default": 8,
+        "default_source": "",
+        "max_tool_calls": 3,
+        "tool_timeout_s": 30,
+        "tool_server_url": "http://localhost:8100",
+        "max_response_tokens": 5120,
+        "tool_budget_feedback": true,
+        "max_consecutive_tool_errors": 20
+      }
+    }
+  },
+  "ray_kwargs": {
+    "value": {
+      "ray_init": {
+        "num_cpus": null
+      },
+      "timeline_json_file": null
+    }
+  },
+  "ti_to_check": {
+    "value": {
+      "num_samples": 4,
+      "every_n_steps": 50
+    }
+  },
+  "transfer_queue": {
+    "value": {
+      "enable": false
+    }
+  },
+  "global_profiler": {
+    "value": {
+      "tool": null,
+      "steps": null,
+      "_target_": "verl.utils.profiler.ProfilerConfig",
+      "save_path": "outputs/profile",
+      "global_tool_config": {
+        "nsys": {
+          "discrete": false,
+          "worker_nsight_options": {
+            "kill": "none",
+            "trace": "cuda,nvtx,cublas,ucx",
+            "capture-range": "cudaProfilerApi",
+            "cuda-graph-trace": "graph",
+            "capture-range-end": null,
+            "cuda-memory-usage": "true"
+          },
+          "controller_nsight_options": {
+            "trace": "cuda,nvtx,cublas,ucx",
+            "cuda-graph-trace": "graph",
+            "cuda-memory-usage": "true"
+          }
+        },
+        "torch_memory": {
+          "stacks": "all",
+          "context": "all",
+          "stack_depth": 32,
+          "trace_alloc_max_entries": 100000
+        }
+      },
+      "profile_continuous_steps": false
+    }
+  },
+  "actor_rollout_ref": {
+    "value": {
+      "ref": {
+        "_target_": "verl.workers.config.McoreActorConfig",
+        "megatron": {
+          "seed": 42,
+          "dtype": "bfloat16",
+          "_target_": "verl.workers.config.McoreEngineConfig",
+          "use_mbridge": true,
+          "forward_only": true,
+          "grad_offload": false,
+          "param_offload": true,
+          "router_replay": {
+            "mode": "disabled",
+            "_target_": "verl.workers.config.EngineRouterReplayConfig",
+            "record_file": null,
+            "replay_file": null
+          },
+          "vanilla_mbridge": true,
+          "optimizer_offload": false,
+          "sequence_parallel": true,
+          "use_remove_padding": false,
+          "context_parallel_size": 1,
+          "use_dist_checkpointing": false,
+          "dist_checkpointing_path": null,
+          "dist_checkpointing_prefix": "",
+          "use_distributed_optimizer": true,
+          "expert_model_parallel_size": 8,
+          "tensor_model_parallel_size": 2,
+          "expert_tensor_parallel_size": 1,
+          "override_transformer_config": {
+            "recompute_method": "uniform",
+            "apply_rope_fusion": false,
+            "attention_backend": "auto",
+            "recompute_modules": [
+              "core_attn"
+            ],
+            "recompute_num_layers": 1,
+            "recompute_granularity": "full"
+          },
+          "pipeline_model_parallel_size": 1,
+          "dist_ckpt_optim_fully_reshardable": true,
+          "virtual_pipeline_model_parallel_size": null,
+          "distrib_optim_fully_reshardable_mem_efficient": false
+        },
+        "profiler": {
+          "tool": null,
+          "ranks": [],
+          "enable": false,
+          "_target_": "verl.utils.profiler.ProfilerConfig",
+          "all_ranks": false,
+          "save_path": "outputs/profile",
+          "tool_config": {
+            "npu": {
+              "level": "level0",
+              "_target_": "verl.utils.profiler.config.NPUToolConfig",
+              "analysis": true,
+              "contents": [],
+              "discrete": false
+            },
+            "nsys": {
+              "_target_": "verl.utils.profiler.config.NsightToolConfig",
+              "discrete": false
+            },
+            "torch": {
+              "_target_": "verl.utils.profiler.config.TorchProfilerToolConfig",
+              "contents": [],
+              "discrete": false
+            },
+            "torch_memory": {
+              "_target_": "verl.utils.profiler.config.TorchMemoryToolConfig",
+              "stack_depth": 32,
+              "trace_alloc_max_entries": 100000
+            }
+          }
+        },
+        "strategy": "megatron",
+        "rollout_n": 8,
+        "load_weight": true,
+        "router_replay": {
+          "mode": "disabled",
+          "_target_": "verl.workers.config.RouterReplayConfig",
+          "record_file": null,
+          "replay_file": null
+        },
+        "use_torch_compile": true,
+        "log_prob_use_dynamic_bsz": false,
+        "log_prob_micro_batch_size": null,
+        "log_prob_max_token_len_per_gpu": 16384,
+        "log_prob_micro_batch_size_per_gpu": 1
+      },
+      "actor": {
+        "optim": {
+          "lr": 5e-7,
+          "betas": [
+            0.9,
+            0.999
+          ],
+          "min_lr": 1e-7,
+          "_target_": "verl.workers.config.McoreOptimizerConfig",
+          "clip_grad": 1,
+          "optimizer": "adam",
+          "weight_decay": 0,
+          "lr_decay_steps": null,
+          "lr_decay_style": "cosine",
+          "lr_warmup_init": 0,
+          "lr_warmup_steps": -1,
+          "lr_wsd_decay_steps": null,
+          "lr_wsd_decay_style": "exponential",
+          "total_training_steps": 257,
+          "lr_warmup_steps_ratio": 0.03,
+          "weight_decay_incr_style": "constant",
+          "override_optimizer_config": {
+            "optimizer_cpu_offload": true,
+            "optimizer_offload_fraction": 1,
+            "overlap_cpu_optimizer_d2h_h2d": true,
+            "use_precision_aware_optimizer": true
+          },
+          "use_checkpoint_opt_param_scheduler": true
+        },
+        "shuffle": false,
+        "tau_neg": 1.05,
+        "tau_pos": 1,
+        "_target_": "verl.workers.config.McoreActorConfig",
+        "megatron": {
+          "seed": 42,
+          "dtype": "bfloat16",
+          "_target_": "verl.workers.config.McoreEngineConfig",
+          "use_mbridge": true,
+          "forward_only": false,
+          "grad_offload": true,
+          "param_offload": true,
+          "router_replay": {
+            "mode": "disabled",
+            "_target_": "verl.workers.config.EngineRouterReplayConfig",
+            "record_file": null,
+            "replay_file": null
+          },
+          "vanilla_mbridge": true,
+          "optimizer_offload": true,
+          "sequence_parallel": true,
+          "use_remove_padding": false,
+          "context_parallel_size": 1,
+          "use_dist_checkpointing": true,
+          "dist_checkpointing_path": "checkpoints/qwen3_5_35b_TP2_EP8_PP1/dist_ckpt",
+          "dist_checkpointing_prefix": "",
+          "use_distributed_optimizer": true,
+          "expert_model_parallel_size": 8,
+          "tensor_model_parallel_size": 2,
+          "expert_tensor_parallel_size": 1,
+          "override_transformer_config": {
+            "recompute_method": "uniform",
+            "apply_rope_fusion": false,
+            "attention_backend": "auto",
+            "recompute_modules": [
+              "core_attn"
+            ],
+            "recompute_num_layers": 1,
+            "recompute_granularity": "full"
+          },
+          "pipeline_model_parallel_size": 1,
+          "dist_ckpt_optim_fully_reshardable": false,
+          "virtual_pipeline_model_parallel_size": null,
+          "distrib_optim_fully_reshardable_mem_efficient": false
+        },
+        "profiler": {
+          "tool": null,
+          "ranks": [],
+          "enable": false,
+          "_target_": "verl.utils.profiler.ProfilerConfig",
+          "all_ranks": false,
+          "save_path": "outputs/profile",
+          "tool_config": {
+            "npu": {
+              "level": "level0",
+              "_target_": "verl.utils.profiler.config.NPUToolConfig",
+              "analysis": true,
+              "contents": [],
+              "discrete": false
+            },
+            "nsys": {
+              "_target_": "verl.utils.profiler.config.NsightToolConfig",
+              "discrete": false
+            },
+            "torch": {
+              "_target_": "verl.utils.profiler.config.TorchProfilerToolConfig",
+              "contents": [],
+              "discrete": false
+            },
+            "torch_memory": {
+              "_target_": "verl.utils.profiler.config.TorchMemoryToolConfig",
+              "stack_depth": 32,
+              "trace_alloc_max_entries": 100000
+            }
+          }
+        },
+        "strategy": "megatron",
+        "rollout_n": 8,
+        "checkpoint": {
+          "_target_": "verl.trainer.config.CheckpointConfig",
+          "async_save": false,
+          "load_contents": [
+            "model",
+            "optimizer",
+            "extra"
+          ],
+          "save_contents": [
+            "model",
+            "optimizer",
+            "extra"
+          ]
+        },
+        "clip_ratio": 0.2,
+        "ppo_epochs": 1,
+        "load_weight": true,
+        "policy_loss": {
+          "_target_": "verl.workers.config.PolicyLossConfig",
+          "loss_mode": "gspo",
+          "clip_cov_lb": 1,
+          "clip_cov_ub": 5,
+          "ppo_kl_coef": 0.1,
+          "kl_cov_ratio": 0.0002,
+          "clip_cov_ratio": 0.0002
+        },
+        "use_kl_loss": false,
+        "clip_ratio_c": 10,
+        "kl_loss_coef": 0.001,
+        "kl_loss_type": "low_var_kl",
+        "entropy_coeff": 0,
+        "loss_agg_mode": "seq-mean-token-mean",
+        "router_replay": {
+          "mode": "disabled",
+          "_target_": "verl.workers.config.RouterReplayConfig",
+          "record_file": null,
+          "replay_file": null
+        },
+        "clip_ratio_low": 0.0003,
+        "clip_ratio_high": 0.0004,
+        "use_dynamic_bsz": false,
+        "data_loader_seed": 42,
+        "calculate_entropy": false,
+        "loss_scale_factor": null,
+        "use_fused_kernels": false,
+        "use_torch_compile": true,
+        "use_prefix_grouper": false,
+        "freeze_vision_tower": false,
+        "ppo_mini_batch_size": 32,
+        "ppo_micro_batch_size": null,
+        "ppo_max_token_len_per_gpu": 16384,
+        "ppo_micro_batch_size_per_gpu": 1
+      },
+      "model": {
+        "mtp": {
+          "enable": false,
+          "method": "mtp",
+          "_target_": "verl.workers.config.MtpConfig",
+          "enable_train": false,
+          "detach_encoder": false,
+          "enable_rollout": false,
+          "speculative_algorithm": "EAGLE",
+          "speculative_num_steps": 3,
+          "num_speculative_tokens": 1,
+          "speculative_eagle_topk": 1,
+          "mtp_loss_scaling_factor": 0.1,
+          "speculative_num_draft_tokens": 4
+        },
+        "lora": {
+          "rank": 0,
+          "type": "lora",
+          "alpha": 32,
+          "dtype": null,
+          "merge": false,
+          "dropout": 0,
+          "adapter_path": null,
+          "target_modules": [
+            "linear_qkv",
+            "linear_proj",
+            "linear_fc1",
+            "linear_fc2"
+          ],
+          "exclude_modules": [],
+          "a2a_experimental": false,
+          "dropout_position": "pre",
+          "lora_A_init_method": "xavier",
+          "lora_B_init_method": "zero",
+          "freeze_vision_model": true,
+          "freeze_language_model": true,
+          "freeze_vision_projection": true
+        },
+        "path": "Qwen/Qwen3.5-35B-A3B",
+        "use_shm": false,
+        "_target_": "verl.workers.config.HFModelConfig",
+        "lora_rank": 0,
+        "tiled_mlp": {
+          "enabled": false,
+          "num_shards": 4
+        },
+        "use_liger": false,
+        "lora_alpha": 16,
+        "external_lib": null,
+        "hf_config_path": null,
+        "target_modules": "all-linear",
+        "tokenizer_path": null,
+        "exclude_modules": null,
+        "override_config": {
+          "moe_config": {
+            "freeze_moe_router": false
+          }
+        },
+        "lora_adapter_path": null,
+        "trust_remote_code": true,
+        "use_fused_kernels": false,
+        "use_remove_padding": false,
+        "custom_chat_template": null,
+        "fused_kernel_options": {
+          "impl_backend": "torch"
+        },
+        "enable_activation_offload": false,
+        "enable_gradient_checkpointing": true
+      },
+      "rollout": {
+        "n": 8,
+        "mtp": {
+          "enable": false,
+          "method": "mtp",
+          "_target_": "verl.workers.config.MtpConfig",
+          "enable_train": false,
+          "detach_encoder": false,
+          "enable_rollout": false,
+          "speculative_algorithm": "EAGLE",
+          "speculative_num_steps": 3,
+          "num_speculative_tokens": 1,
+          "speculative_eagle_topk": 1,
+          "mtp_loss_scaling_factor": 0.1,
+          "speculative_num_draft_tokens": 4
+        },
+        "qat": null,
+        "mode": "async",
+        "name": "vllm",
+        "agent": {
+          "_target_": "verl.workers.config.AgentLoopConfig",
+          "num_workers": 64,
+          "default_agent_loop": "single_turn_agent",
+          "custom_async_server": {
+            "name": null,
+            "path": null,
+            "_target_": "verl.workers.config.CustomAsyncServerConfig"
+          },
+          "agent_loop_config_path": "configs/agent_loop_registry.yaml"
+        },
+        "dtype": "bfloat16",
+        "top_k": -1,
+        "top_p": 0.8,
+        "trace": {
+          "backend": null,
+          "_target_": "verl.workers.config.TraceConfig",
+          "token2text": false,
+          "project_name": "agentic_retrieval_gspo",
+          "experiment_name": "qwen3_moe_a3b_musique",
+          "max_samples_per_step_per_worker": null
+        },
+        "nnodes": 0,
+        "_target_": "verl.workers.config.RolloutConfig",
+        "profiler": {
+          "tool": null,
+          "ranks": [],
+          "enable": false,
+          "_target_": "verl.utils.profiler.ProfilerConfig",
+          "all_ranks": false,
+          "save_path": "outputs/profile",
+          "tool_config": {
+            "npu": {
+              "level": "level0",
+              "_target_": "verl.utils.profiler.config.NPUToolConfig",
+              "analysis": true,
+              "contents": [],
+              "discrete": false
+            },
+            "torch": {
+              "_target_": "verl.utils.profiler.config.TorchProfilerToolConfig",
+              "contents": [],
+              "discrete": false
+            }
+          }
+        },
+        "do_sample": true,
+        "ignore_eos": false,
+        "multi_turn": {
+          "enable": true,
+          "format": "hermes",
+          "_target_": "verl.workers.config.MultiTurnConfig",
+          "max_user_turns": 0,
+          "tool_config_path": null,
+          "max_parallel_calls": 1,
+          "max_assistant_turns": 6,
+          "num_repeat_rollouts": null,
+          "interaction_config_path": null,
+          "max_tool_response_length": 8096,
+          "tool_response_truncate_side": "left",
+          "use_inference_chat_template": false,
+          "tokenization_sanity_check_mode": "strict"
+        },
+        "prometheus": {
+          "file": "/tmp/ray/session_latest/metrics/prometheus/prometheus.yml",
+          "port": 9090,
+          "enable": false,
+          "_target_": "verl.workers.config.PrometheusConfig",
+          "served_model_name": "Qwen/Qwen3.5-35B-A3B"
+        },
+        "val_kwargs": {
+          "n": 1,
+          "top_k": -1,
+          "top_p": 0.8,
+          "_target_": "verl.workers.config.SamplingConfig",
+          "do_sample": false,
+          "temperature": 0.1
+        },
+        "load_format": "dummy",
+        "temperature": 1,
+        "max_num_seqs": 16,
+        "quantization": null,
+        "skip_rollout": false,
+        "enforce_eager": false,
+        "logprobs_mode": "processed_logprobs",
+        "max_model_len": 26624,
+        "prompt_length": 2048,
+        "skip_dump_dir": "/tmp/rollout_dump",
+        "layer_name_map": {
+          "qkv_layer_name": "qkv",
+          "gate_proj_layer_name": "gate_up"
+        },
+        "n_gpus_per_node": 8,
+        "response_length": 24576,
+        "over_sample_rate": 0,
+        "checkpoint_engine": {
+          "backend": "naive",
+          "_target_": "verl.workers.config.CheckpointEngineConfig",
+          "update_weights_bucket_megabytes": 4096
+        },
+        "disable_log_stats": true,
+        "free_cache_engine": true,
+        "scheduling_policy": "fcfs",
+        "data_parallel_size": 1,
+        "calculate_log_probs": false,
+        "multi_stage_wake_up": false,
+        "skip_tokenizer_init": true,
+        "expert_parallel_size": 1,
+        "enable_prefix_caching": true,
+        "enable_chunked_prefill": true,
+        "gpu_memory_utilization": 0.45,
+        "max_num_batched_tokens": 8192,
+        "cudagraph_capture_sizes": null,
+        "log_prob_use_dynamic_bsz": false,
+        "quantization_config_file": null,
+        "log_prob_micro_batch_size": null,
+        "tensor_model_parallel_size": 2,
+        "pipeline_model_parallel_size": 1,
+        "enable_rollout_routing_replay": false,
+        "log_prob_max_token_len_per_gpu": 16384,
+        "log_prob_micro_batch_size_per_gpu": 1
+      },
+      "nccl_timeout": 600,
+      "hybrid_engine": true
+    }
+  }
+}

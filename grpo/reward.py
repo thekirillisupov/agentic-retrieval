@@ -152,6 +152,14 @@ def compute_score(
     answered = stopped == "answer"
     answer_bonus_val = answer_bonus if answered else 0.0
 
+    # tool_budget_feedback diagnostics:
+    #   num_over_budget_calls - tool calls the model emitted after the budget was
+    #                           spent (each ignored the "return <answer>" nudge).
+    #   budget_truncated      - 1.0 iff the rollout was cut because it hit the
+    #                           tool-call budget without ever emitting <answer>.
+    num_over_budget_calls = float(info.get("num_over_budget_calls", 0))
+    budget_truncated = 1.0 if stopped == "max_tool_calls" else 0.0
+
     composite = alpha * ndcg + (1.0 - alpha) * fbeta_val
     score = composite - len_pen + format_penalty + answer_bonus_val
 
@@ -169,6 +177,8 @@ def compute_score(
         "response_len": float(response_len),
         "stopped_reason": stopped,
         "num_tool_calls": float(info.get("num_tool_calls", 0)),
+        "num_over_budget_calls": num_over_budget_calls,
+        "budget_truncated": budget_truncated,
         "num_answer_docs": float(len(ranked)),
         "answered": float(answered),
     }
