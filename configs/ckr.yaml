@@ -31,7 +31,7 @@ embedder:
   passage_prefix: ""
 
 index:
-  top_k_default: 5
+  top_k_default: 8
   top_k_max: 50
   use_gpu: false
   cache_size: 10000
@@ -67,7 +67,7 @@ agent:
 eval:
   processed_dir: ./data/processed/ckr/
   eval_dataset_path: ./data/processed/ckr/eval.jsonl
-  ndcg_k: 5
+  ndcg_k: 16
 
 trajectories:
   output_dir: ./trajectories_data/

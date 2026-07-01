@@ -47,16 +47,63 @@ both, quantize twice or concatenate questions and run once per version on a spli
 
 > The chosen questions are single-turn (system + query). That covers the
 > system-prompt + tool-schema + query distribution, which is what weight-only
-> quant needs. For full fidelity including tool-result turns, build calibration
-> from recorded `trajectories_data/` rollouts instead (not wired here — ask if
-> you want it).
+> quant needs. For full fidelity including tool-result turns, use
+> `--trajectories` (see below).
+
+### Trajectory-based calibration (higher fidelity)
+
+Pass `--trajectories` instead of `--questions` to source calibration from real
+training data. Two sub-formats are supported:
+
+**`grpo_train.parquet`** — reads the `prompt` column (already-formatted
+`[system, user]` message arrays).  Each row's `prompt_version` is read from
+`extra_info` so mixed-source parquets (musique + sbol + ckr) are handled
+automatically.  The prompts are single-turn, identical in fidelity to the
+question-based path, but sourced directly from the training distribution:
+
+```bash
+python -m quantize.quantize \
+  --model checkpoints/hf_model_3_step_ndcg \
+  --trajectories data/processed/unioned/grpo_train.parquet \
+  --output checkpoints/quantized/qwen3_5_35b_a3b_w8a8 \
+  --scheme W8A8 --num-samples 512
+```
+
+**`trajectories_data/*.jsonl`** — reads the `messages_full` field (full
+multi-turn rollout: system + user + tool-calls + tool-results + final answer).
+This is the highest-fidelity calibration path: it activates the MoE experts
+that are only visited during multi-turn reasoning, which matters for W8A8.
+Trajectory JSONL files are written by the GRPO trainer to
+`val_trajectory_dir: trajectories_data/gspo_qwen3_moe/` (e.g. `65.jsonl`):
+
+```bash
+python -m quantize.quantize \
+  --model checkpoints/hf_model_3_step_ndcg \
+  --trajectories trajectories_data/gspo_qwen3_moe/65.jsonl \
+  --output checkpoints/quantized/qwen3_5_35b_a3b_w8a8 \
+  --scheme W8A8 --num-samples 512
+```
+
+Use `--trajectory-prompt-field` (default `prompt`) for parquet or
+`--trajectory-messages-field` (default `messages_full`) for JSONL to override
+the column/key names.
 
 ## Run
 
-In an inference/quant env (NOT the Megatron training env) with
-`llmcompressor>=0.9.0`, `transformers`, `torch`:
+Create a dedicated inference/quant venv (separate from the Megatron training
+env). Do **not** use `--system-site-packages` — inheriting the training env
+pulls in `transformer_engine`/`peft` and can break `llmcompressor` imports
+(cuDNN not found):
 
 ```bash
+python -m venv inference_venv
+source inference_venv/bin/activate
+pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 \
+  --index-url https://download.pytorch.org/whl/cu129
+pip install 'llmcompressor>=0.9.0' transformers
+```
+
+Then run quantization:
 # 1. Merge the Megatron actor to HF first (if not already done)
 bash scripts/dist_ckpt_to_hf.sh --actor-dir checkpoints/gspo_qwen3_moe/global_step_40/actor ...
 
