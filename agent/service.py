@@ -31,6 +31,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from agent.harness import AgentHarness, ToolServerClient
+from agent.prompts import PROFILES
 from agent.schemas import AgentInput, Message
 
 log = logging.getLogger(__name__)
@@ -94,6 +95,10 @@ class RetrieveRequest(BaseModel):
     max_turns: int | None = None
     max_tool_calls: int | None = None
     top_k_default: int | None = None
+    # Prompt profile to run with (e.g. "v2" = search + get_neighbours,
+    # "v2_search_only" = search only). None -> config default. Each profile fixes
+    # its own tool set / user-turn wrapping, so this also switches which tools the
+    # model is offered. See GET /prompts for the available versions.
     prompt_version: str | None = None
     # Include the full ReAct trajectory (messages, tool calls, tokens) in the
     # response. Off by default to keep responses small.
@@ -127,12 +132,25 @@ def create_app(config_path: str | None = None) -> FastAPI:
     def healthz() -> dict[str, str]:
         return {"status": "ok"}
 
+    @app.get("/prompts")
+    def prompts() -> dict[str, Any]:
+        """Prompt versions the harness can run, and the current default."""
+        return {
+            "default": agent_cfg.get("prompt_version", "v2"),
+            "available": sorted(PROFILES),
+        }
+
     @app.post("/retrieve")
     def retrieve(req: RetrieveRequest) -> dict[str, Any]:
         if not req.messages:
             raise HTTPException(400, "messages must not be empty")
 
         pv = req.prompt_version or agent_cfg.get("prompt_version", "v2")
+        if pv not in PROFILES:
+            raise HTTPException(
+                400,
+                f"unknown prompt_version {pv!r}; available={sorted(PROFILES)}",
+            )
         tool = _make_tool_client()
         harness = AgentHarness(
             model=model_cfg["name"],

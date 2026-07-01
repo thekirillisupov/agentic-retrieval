@@ -109,9 +109,15 @@ docker run --gpus all -p 8080:8080 \
 # each search / get_neighbours call.
 curl -s localhost:8080/retrieve -H 'content-type: application/json' -d '{
   "messages": [{"role": "user", "content": "who directed the sequel to Alien?"}],
-  "search_params": {}
+  "search_params": {},
+  "prompt_version": "v2"
 }'
 ```
+
+`prompt_version` is per-request (falls back to the config default): `v2`
+(search + get_neighbours) or `v2_search_only` (search only). Each profile fixes
+its own tool set, so this also switches which tools the model is offered. `GET
+/prompts` lists the available versions.
 
 Config lives in [`configs/inference.yaml`](./configs/inference.yaml); `VLLM_URL`,
 `MODEL_NAME`, `SEARCH_URL` override it at runtime. `agent.prompt_version`,
