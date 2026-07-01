@@ -168,13 +168,13 @@ actor_rollout_ref:
     top_k: -1
     do_sample: true
     prompt_length: 2048   # initial prompt_ids; SBOL multi-turn dialogs reach ~1550 tok
-    response_length: 15360  # trimmed from 28000 to cap worst-case LM-head logits memory in the actor backward (q99 rollout ≈26887 tok; longest 1% get truncated)
+    response_length: 16000  # trimmed from 28000 to cap worst-case LM-head logits memory in the actor backward (q99 rollout ≈26887 tok; longest 1% get truncated)
     gpu_memory_utilization: 0.45   # lowered from 0.50 to leave more headroom for the Megatron actor backward on GPU 0
     max_num_seqs: 16                # reduced from 16 to keep KV cache footprint small at the higher utilisation
     tensor_model_parallel_size: 2      # vLLM TP
     enforce_eager: false
     free_cache_engine: true
-    max_model_len: 17408   # response_length (15360) + prompt_length (2048)
+    max_model_len: 18488   # response_length (16000) + prompt_length (2048)
     dtype: bfloat16
     # log_prob_use_dynamic_bsz: false
     log_prob_micro_batch_size_per_gpu: 1
@@ -264,7 +264,7 @@ agent_loop:
 trainer:
   project_name: agentic_retrieval_gspo
   experiment_name: qwen3_moe_a3b_musique
-  total_epochs: 1
+  total_epochs: 2
   total_training_steps: null
   nnodes: 1
   n_gpus_per_node: 8

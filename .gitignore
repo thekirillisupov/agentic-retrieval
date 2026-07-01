@@ -3,11 +3,13 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
+inference_venv/
 .env
 
 # Project-specific large artifacts (regenerated, not tracked)
 data/raw/
 data/processed/
+data/calib/
 index/
 indexes/
 trajectories_data/

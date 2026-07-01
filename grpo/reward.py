@@ -67,16 +67,18 @@ log = logging.getLogger(__name__)
 # Default knobs; can be overridden via reward_kwargs in the trainer config.
 DEFAULTS = {
     "ndcg_k": 10,
-    "alpha": 0.7,                   # NDCG weight; (1 - alpha) goes to F_beta
-    "f_beta": 2.0,                  # beta for F_beta (beta>1 => recall-heavy)
-    "length_alpha": 0.0,            # length penalty OFF by default; opt-in
+    "alpha": 0.7,  # NDCG weight; (1 - alpha) goes to F_beta
+    "f_beta": 2.0,  # beta for F_beta (beta>1 => recall-heavy)
+    "length_alpha": 0.0,  # length penalty OFF by default; opt-in
     "length_target_tokens": 4096,
-    "parse_error_penalty": 0.0,     # set to e.g. -0.1 to punish malformed outputs
-    "answer_bonus": 0.0,            # epsilon added when stopped_reason == "answer"
+    "parse_error_penalty": 0.0,  # set to e.g. -0.1 to punish malformed outputs
+    "answer_bonus": 0.0,  # epsilon added when stopped_reason == "answer"
 }
 
 
-def _gold_from_ground_truth(ground_truth: Any, extra_info: dict[str, Any] | None) -> list[str]:
+def _gold_from_ground_truth(
+    ground_truth: Any, extra_info: dict[str, Any] | None
+) -> list[str]:
     """`reward_model.ground_truth` is JSON-encoded in the parquet (str list)."""
     if extra_info and isinstance(extra_info.get("gold_doc_ids"), list):
         return list(extra_info["gold_doc_ids"])
@@ -92,7 +94,9 @@ def _gold_from_ground_truth(ground_truth: Any, extra_info: dict[str, Any] | None
     return []
 
 
-def _ranked_from_extra(extra_info: dict[str, Any] | None) -> tuple[list[str], dict[str, Any]]:
+def _ranked_from_extra(
+    extra_info: dict[str, Any] | None,
+) -> tuple[list[str], dict[str, Any]]:
     """The AgentLoop puts ``ranked_doc_ids`` etc. under extra_fields; the trainer
     folds extra_fields into ``extra_info`` before calling this fn."""
     if not extra_info:

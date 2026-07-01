@@ -280,7 +280,9 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
             rollout_skip.wrap_generate_sequences()
 
         progress_bar = tqdm(
-            total=self.total_training_steps, initial=self.global_steps, desc="Training Progress"
+            total=self.total_training_steps,
+            initial=self.global_steps,
+            desc="Training Progress",
         )
 
         self.global_steps += 1
@@ -298,7 +300,9 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
         # --- filter_groups state -------------------------------------------------
         fg_cfg = self.config.algorithm.get("filter_groups", None)
         fg_enable = bool(fg_cfg is not None and fg_cfg.get("enable", False))
-        fg_metric = (fg_cfg.get("metric", "score") if fg_cfg is not None else "score") or "score"
+        fg_metric = (
+            fg_cfg.get("metric", "score") if fg_cfg is not None else "score"
+        ) or "score"
         fg_max_num_gen_batches = (
             fg_cfg.get("max_num_gen_batches", 0) if fg_cfg is not None else 0
         ) or 0
@@ -306,9 +310,15 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
         # --- anchored tool-call penalty state ------------------------------------
         tp_cfg = self.config.algorithm.get("tool_penalty", None)
         tp_enable = bool(tp_cfg is not None and tp_cfg.get("enable", True))
-        tp_alpha_win = float(tp_cfg.get("alpha_win", 0.1)) if tp_cfg is not None else 0.1
-        tp_alpha_lose = float(tp_cfg.get("alpha_lose", 0.0)) if tp_cfg is not None else 0.0
-        tp_beta_lose = float(tp_cfg.get("beta_lose", 0.0)) if tp_cfg is not None else 0.0
+        tp_alpha_win = (
+            float(tp_cfg.get("alpha_win", 0.1)) if tp_cfg is not None else 0.1
+        )
+        tp_alpha_lose = (
+            float(tp_cfg.get("alpha_lose", 0.0)) if tp_cfg is not None else 0.0
+        )
+        tp_beta_lose = (
+            float(tp_cfg.get("beta_lose", 0.0)) if tp_cfg is not None else 0.0
+        )
         tp_winner_threshold = (
             float(tp_cfg.get("winner_threshold", 1.0)) if tp_cfg is not None else 1.0
         )
@@ -332,9 +342,15 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
         # docked, discouraging the policy from padding the answer to game recall.
         adp_cfg = self.config.algorithm.get("answer_doc_penalty", None)
         adp_enable = bool(adp_cfg is not None and adp_cfg.get("enable", False))
-        adp_alpha_win = float(adp_cfg.get("alpha_win", 0.05)) if adp_cfg is not None else 0.05
-        adp_alpha_lose = float(adp_cfg.get("alpha_lose", 0.0)) if adp_cfg is not None else 0.0
-        adp_beta_lose = float(adp_cfg.get("beta_lose", 0.0)) if adp_cfg is not None else 0.0
+        adp_alpha_win = (
+            float(adp_cfg.get("alpha_win", 0.05)) if adp_cfg is not None else 0.05
+        )
+        adp_alpha_lose = (
+            float(adp_cfg.get("alpha_lose", 0.0)) if adp_cfg is not None else 0.0
+        )
+        adp_beta_lose = (
+            float(adp_cfg.get("beta_lose", 0.0)) if adp_cfg is not None else 0.0
+        )
         adp_winner_threshold = (
             float(adp_cfg.get("winner_threshold", 1.0)) if adp_cfg is not None else 1.0
         )
@@ -405,9 +421,12 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
                     )
 
                 new_batch: DataProto = DataProto.from_single_dict(batch_dict)
-                new_batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+                new_batch.meta_info["temperature"] = (
+                    self.config.actor_rollout_ref.rollout.temperature
+                )
                 new_batch.non_tensor_batch["uid"] = np.array(
-                    [str(uuid.uuid4()) for _ in range(len(new_batch.batch))], dtype=object
+                    [str(uuid.uuid4()) for _ in range(len(new_batch.batch))],
+                    dtype=object,
                 )
 
                 gen_batch = self._get_gen_batch(new_batch)
@@ -421,7 +440,11 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
                     with marked_timer("gen", timing_raw, color="red"):
                         if curr_step_profile:
                             self.async_rollout_manager.start_profile()
-                        gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+                        gen_batch_output = (
+                            self.async_rollout_manager.generate_sequences(
+                                gen_batch_output
+                            )
+                        )
                         # NOTE: do NOT call self.checkpoint_manager.sleep_replicas() here.
                         # Upstream RayPPOTrainer.fit() sleeps right after generate because
                         # it only does one rollout per step. With filter_groups, when
@@ -449,8 +472,10 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
                             gen_baseline_batch.meta_info["do_sample"] = False
                             if curr_step_profile:
                                 self.async_rollout_manager.start_profile()
-                            gen_baseline_output = self.async_rollout_manager.generate_sequences(
-                                gen_baseline_batch
+                            gen_baseline_output = (
+                                self.async_rollout_manager.generate_sequences(
+                                    gen_baseline_batch
+                                )
                             )
                             # NOTE: same reason as above — sleep is deferred until the
                             # filter loop exits with a complete batch.
@@ -458,11 +483,16 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
                                 self.async_rollout_manager.stop_profile()
                             new_batch = new_batch.union(gen_baseline_output)
                             rm_scores = None
-                            if self.use_rm and "rm_scores" not in new_batch.batch.keys():
+                            if (
+                                self.use_rm
+                                and "rm_scores" not in new_batch.batch.keys()
+                            ):
                                 batch_reward = self._compute_reward_colocate(new_batch)
                                 new_batch = new_batch.union(batch_reward)
 
-                            reward_baseline_tensor = new_batch.batch["rm_scores"].sum(dim=-1)
+                            reward_baseline_tensor = new_batch.batch["rm_scores"].sum(
+                                dim=-1
+                            )
 
                             keys_to_pop = set(gen_baseline_output.batch.keys())
                             if rm_scores is not None:
@@ -473,17 +503,23 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
 
                             del rm_scores, gen_baseline_batch, gen_baseline_output
 
-                    new_batch = new_batch.repeat(repeat_times=rollout_n, interleave=True)
+                    new_batch = new_batch.repeat(
+                        repeat_times=rollout_n, interleave=True
+                    )
                     new_batch = new_batch.union(gen_batch_output)
 
                     if "response_mask" not in new_batch.batch.keys():
-                        new_batch.batch["response_mask"] = compute_response_mask(new_batch)
+                        new_batch.batch["response_mask"] = compute_response_mask(
+                            new_batch
+                        )
 
                     with marked_timer("reward", timing_raw, color="yellow"):
                         if self.use_rm and "rm_scores" not in new_batch.batch.keys():
                             batch_reward = self._compute_reward_colocate(new_batch)
                             new_batch = new_batch.union(batch_reward)
-                        reward_tensor, reward_extra_infos_dict = extract_reward(new_batch)
+                        reward_tensor, reward_extra_infos_dict = extract_reward(
+                            new_batch
+                        )
 
                     # Persist reward into the batch *before* the filter so
                     # ``DataProto.concat`` carries it across gen batches.
@@ -532,11 +568,17 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
                         if fg_metric not in new_batch.non_tensor_batch:
                             if fg_metric == "seq_reward":
                                 new_batch.non_tensor_batch["seq_reward"] = (
-                                    new_batch.batch["token_level_scores"].sum(dim=-1).cpu().numpy()
+                                    new_batch.batch["token_level_scores"]
+                                    .sum(dim=-1)
+                                    .cpu()
+                                    .numpy()
                                 )
                             elif fg_metric == "seq_final_reward":
                                 new_batch.non_tensor_batch["seq_final_reward"] = (
-                                    new_batch.batch["token_level_scores"].sum(dim=-1).cpu().numpy()
+                                    new_batch.batch["token_level_scores"]
+                                    .sum(dim=-1)
+                                    .cpu()
+                                    .numpy()
                                 )
                             else:
                                 raise KeyError(
@@ -547,8 +589,10 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
                                 )
 
                         metric_vals = np.asarray(new_batch.non_tensor_batch[fg_metric])
-                        kept_uids, n_filtered, n_all_zero, n_all_one = _compute_kept_uids(
-                            new_batch.non_tensor_batch["uid"], metric_vals
+                        kept_uids, n_filtered, n_all_zero, n_all_one = (
+                            _compute_kept_uids(
+                                new_batch.non_tensor_batch["uid"], metric_vals
+                            )
                         )
 
                         total_filtered_groups += n_filtered
@@ -572,7 +616,10 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
                         )
 
                         if num_prompt_in_batch < train_bsz:
-                            if fg_max_num_gen_batches <= 0 or num_gen_batches < fg_max_num_gen_batches:
+                            if (
+                                fg_max_num_gen_batches <= 0
+                                or num_gen_batches < fg_max_num_gen_batches
+                            ):
                                 print(
                                     f"[filter_groups] step={self.global_steps} "
                                     f"num_prompt_in_batch={num_prompt_in_batch} < "
@@ -583,7 +630,8 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
                                 )
                                 with marked_timer("stop_profile", timing_raw):
                                     next_step_profile = (
-                                        self.global_steps + 1 in self.config.global_profiler.steps
+                                        self.global_steps + 1
+                                        in self.config.global_profiler.steps
                                         if self.config.global_profiler.steps is not None
                                         else False
                                     )
@@ -639,7 +687,9 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
                     ):
                         if "image_grid_thw" not in multi_modal_input.keys():
                             continue
-                        images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
+                        images_seqlens_all.extend(
+                            multi_modal_input["images_seqlens"].tolist()
+                        )
                     batch.meta_info["images_seqlens"] = images_seqlens_all
 
                     # ``token_level_scores`` and ``reward_extra_infos_dict``
@@ -648,12 +698,17 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
                     # assignments here so we don't clobber the accumulated
                     # batch with only the *last* gen batch's reward.
 
-                    rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
-                    bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get(
-                        "bypass_mode", False
+                    rollout_corr_config = self.config.algorithm.get(
+                        "rollout_correction", None
+                    )
+                    bypass_recomputing_logprobs = (
+                        rollout_corr_config
+                        and rollout_corr_config.get("bypass_mode", False)
                     )
                     if bypass_recomputing_logprobs:
-                        from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
+                        from verl.trainer.ppo.rollout_corr_helper import (
+                            apply_bypass_mode,
+                        )
 
                         apply_bypass_mode(
                             batch=batch,
@@ -662,7 +717,9 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
                         )
                     else:
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
-                            old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
+                            old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(
+                                batch
+                            )
                             entropys = old_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]
                             actor_config = self.config.actor_rollout_ref.actor
@@ -691,16 +748,20 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
                                 )
                             batch = batch.union(old_log_prob)
                             if "rollout_log_probs" in batch.batch.keys():
-                                from verl.utils.debug.metrics import calculate_debug_metrics
+                                from verl.utils.debug.metrics import (
+                                    calculate_debug_metrics,
+                                )
 
                                 metrics.update(calculate_debug_metrics(batch))
 
-                    assert "old_log_probs" in batch.batch, (
-                        f'"old_log_prob" not in {batch.batch.keys()=}'
-                    )
+                    assert (
+                        "old_log_probs" in batch.batch
+                    ), f'"old_log_prob" not in {batch.batch.keys()=}'
 
                     if self.use_reference_policy:
-                        with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
+                        with marked_timer(
+                            str(Role.RefPolicy), timing_raw, color="olive"
+                        ):
                             ref_log_prob = self._compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
 
@@ -721,7 +782,9 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
                             )
                             metrics.update(kl_metrics)
                         else:
-                            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+                            batch.batch["token_level_rewards"] = batch.batch[
+                                "token_level_scores"
+                            ]
 
                         if (
                             rollout_corr_config is not None
@@ -732,8 +795,10 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
                                 compute_rollout_correction_and_add_to_batch,
                             )
 
-                            batch, is_metrics = compute_rollout_correction_and_add_to_batch(
-                                batch, rollout_corr_config
+                            batch, is_metrics = (
+                                compute_rollout_correction_and_add_to_batch(
+                                    batch, rollout_corr_config
+                                )
                             )
                             metrics.update(is_metrics)
 
@@ -754,7 +819,9 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
                             critic_output = self._update_critic(batch)
-                        critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
+                        critic_output_metrics = reduce_metrics(
+                            critic_output.meta_info["metrics"]
+                        )
                         metrics.update(critic_output_metrics)
 
                     if self.config.trainer.critic_warmup <= self.global_steps:
@@ -771,22 +838,31 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
                             or esi_close_to_expiration
                         ):
                             if esi_close_to_expiration:
-                                print("Force saving checkpoint: ESI instance expiration approaching.")
-                            with marked_timer("save_checkpoint", timing_raw, color="green"):
+                                print(
+                                    "Force saving checkpoint: ESI instance expiration approaching."
+                                )
+                            with marked_timer(
+                                "save_checkpoint", timing_raw, color="green"
+                            ):
                                 self._save_checkpoint()
 
                         with marked_timer("update_weights", timing_raw, color="red"):
                             self.checkpoint_manager.update_weights(self.global_steps)
 
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                        actor_output_metrics = reduce_metrics(
+                            actor_output.meta_info["metrics"]
+                        )
                         metrics.update(actor_output_metrics)
 
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
-                        self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+                        self._log_rollout_data(
+                            batch, reward_extra_infos_dict, timing_raw, rollout_data_dir
+                        )
 
                 if self.config.trainer.test_freq > 0 and (
-                    is_last_step or self.global_steps % self.config.trainer.test_freq == 0
+                    is_last_step
+                    or self.global_steps % self.config.trainer.test_freq == 0
                 ):
                     with marked_timer("testing", timing_raw, color="green"):
                         val_metrics: dict = self._validate()
@@ -817,7 +893,9 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
                         "training/epoch": epoch,
                     }
                 )
-                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                metrics.update(
+                    compute_data_metrics(batch=batch, use_critic=self.use_critic)
+                )
                 gdpo_reward_keys = self.config.algorithm.get("gdpo_reward_keys", None)
                 if gdpo_reward_keys and self.config.algorithm.adv_estimator in (
                     "gdpo",
@@ -825,21 +903,35 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
                 ):
                     for key in gdpo_reward_keys:
                         if key in batch.non_tensor_batch:
-                            vals = np.asarray(batch.non_tensor_batch[key], dtype=np.float32)
+                            vals = np.asarray(
+                                batch.non_tensor_batch[key], dtype=np.float32
+                            )
                             metrics[f"gdpo/{key}/mean"] = float(np.mean(vals))
                             metrics[f"gdpo/{key}/std"] = float(np.std(vals))
                             metrics[f"gdpo/{key}/max"] = float(np.max(vals))
                             metrics[f"gdpo/{key}/min"] = float(np.min(vals))
-                metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                metrics.update(
+                    compute_timing_metrics(batch=batch, timing_raw=timing_raw)
+                )
                 n_gpus = self.resource_pool_manager.get_n_gpus()
-                metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+                metrics.update(
+                    compute_throughout_metrics(
+                        batch=batch, timing_raw=timing_raw, n_gpus=n_gpus
+                    )
+                )
                 gradient_norm = metrics.get("actor/grad_norm", None)
-                metrics.update(compute_variance_proxy_metrics(batch=batch, gradient_norm=gradient_norm))
+                metrics.update(
+                    compute_variance_proxy_metrics(
+                        batch=batch, gradient_norm=gradient_norm
+                    )
+                )
 
                 # filter_groups bookkeeping metrics
                 metrics["train/num_gen_batches"] = float(num_gen_batches)
                 if fg_enable:
-                    metrics["filter_groups/total_filtered_groups"] = float(total_filtered_groups)
+                    metrics["filter_groups/total_filtered_groups"] = float(
+                        total_filtered_groups
+                    )
                     metrics["filter_groups/total_generated_groups"] = float(
                         num_gen_batches * train_bsz
                     )
@@ -847,11 +939,17 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
                     # their common metric value. Overrides the post-filter 0s
                     # emitted by ``compute_filter_groups_metrics`` (which sees
                     # the trimmed batch, where n_filtered is always 0).
-                    metrics["filter_groups/n_filtered_all_zero"] = float(total_filtered_all_zero)
-                    metrics["filter_groups/n_filtered_all_one"] = float(total_filtered_all_one)
+                    metrics["filter_groups/n_filtered_all_zero"] = float(
+                        total_filtered_all_zero
+                    )
+                    metrics["filter_groups/n_filtered_all_one"] = float(
+                        total_filtered_all_one
+                    )
 
                 if "response_len" in batch.non_tensor_batch:
-                    _rlen = np.asarray(batch.non_tensor_batch["response_len"], dtype=np.float32)
+                    _rlen = np.asarray(
+                        batch.non_tensor_batch["response_len"], dtype=np.float32
+                    )
                     metrics["response_length/q_99"] = float(np.percentile(_rlen, 99))
 
                 # Anchored tool-call penalty diagnostics: mean tool calls among
@@ -863,8 +961,12 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
                     and "base_score" in batch.non_tensor_batch
                     and "num_tool_calls" in batch.non_tensor_batch
                 ):
-                    _base = np.asarray(batch.non_tensor_batch["base_score"], dtype=np.float64)
-                    _ntc = np.asarray(batch.non_tensor_batch["num_tool_calls"], dtype=np.float64)
+                    _base = np.asarray(
+                        batch.non_tensor_batch["base_score"], dtype=np.float64
+                    )
+                    _ntc = np.asarray(
+                        batch.non_tensor_batch["num_tool_calls"], dtype=np.float64
+                    )
                     _win_mask = _base >= (tp_winner_threshold - 1e-6)
                     _zero_mask = _base <= 1e-6
                     metrics["tool_penalty/frac_winners"] = float(np.mean(_win_mask))
@@ -890,7 +992,8 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
                         )
                     if "tool_call_penalty" in batch.non_tensor_batch:
                         _pen = np.asarray(
-                            batch.non_tensor_batch["tool_call_penalty"], dtype=np.float64
+                            batch.non_tensor_batch["tool_call_penalty"],
+                            dtype=np.float64,
                         )
                         metrics["tool_penalty/mean"] = float(_pen.mean())
 
@@ -902,22 +1005,29 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
                     and "base_score" in batch.non_tensor_batch
                     and "num_answer_docs" in batch.non_tensor_batch
                 ):
-                    _base = np.asarray(batch.non_tensor_batch["base_score"], dtype=np.float64)
-                    _nad = np.asarray(batch.non_tensor_batch["num_answer_docs"], dtype=np.float64)
+                    _base = np.asarray(
+                        batch.non_tensor_batch["base_score"], dtype=np.float64
+                    )
+                    _nad = np.asarray(
+                        batch.non_tensor_batch["num_answer_docs"], dtype=np.float64
+                    )
                     _win_mask = _base >= (adp_winner_threshold - 1e-6)
                     _zero_mask = _base <= 1e-6
-                    metrics["answer_doc_penalty/frac_winners"] = float(np.mean(_win_mask))
+                    metrics["answer_doc_penalty/frac_winners"] = float(
+                        np.mean(_win_mask)
+                    )
                     if _win_mask.any():
                         metrics["answer_doc_penalty/mean_answer_docs_winners"] = float(
                             _nad[_win_mask].mean()
                         )
                     if _zero_mask.any():
-                        metrics["answer_doc_penalty/mean_answer_docs_zero_reward"] = float(
-                            _nad[_zero_mask].mean()
+                        metrics["answer_doc_penalty/mean_answer_docs_zero_reward"] = (
+                            float(_nad[_zero_mask].mean())
                         )
                     if "answer_doc_penalty" in batch.non_tensor_batch:
                         _pen = np.asarray(
-                            batch.non_tensor_batch["answer_doc_penalty"], dtype=np.float64
+                            batch.non_tensor_batch["answer_doc_penalty"],
+                            dtype=np.float64,
                         )
                         metrics["answer_doc_penalty/mean"] = float(_pen.mean())
 
@@ -937,7 +1047,8 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
 
                 if (
                     hasattr(self.config.actor_rollout_ref.actor, "profiler")
-                    and self.config.actor_rollout_ref.actor.profiler.tool == "torch_memory"
+                    and self.config.actor_rollout_ref.actor.profiler.tool
+                    == "torch_memory"
                 ):
                     self.actor_rollout_wg.dump_memory_snapshot(
                         tag=f"post_update_step{self.global_steps}",
@@ -946,7 +1057,9 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
 
                 if is_last_step:
                     if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
-                        self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
+                        self.actor_rollout_wg.async_calls_finalize_fn_exec(
+                            blocking=True
+                        )
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     return
@@ -1004,15 +1117,18 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
 
             if "uid" not in test_batch.non_tensor_batch:
                 test_batch.non_tensor_batch["uid"] = np.array(
-                    [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
+                    [str(uuid.uuid4()) for _ in range(len(test_batch.batch))],
+                    dtype=object,
                 )
 
             test_batch = test_batch.repeat(
-                repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
+                repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n,
+                interleave=True,
             )
 
             ground_truths = [
-                item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
+                item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None)
+                for item in test_batch
             ]
             sample_gts.extend(ground_truths)
 
@@ -1028,28 +1144,47 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
             size_divisor = self.config.actor_rollout_ref.rollout.agent.num_workers
-            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
-            test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(
+                test_gen_batch, size_divisor
+            )
+            test_output_gen_batch_padded = (
+                self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+            )
 
-            if self.use_rm and "rm_scores" not in test_output_gen_batch_padded.batch.keys():
+            if (
+                self.use_rm
+                and "rm_scores" not in test_output_gen_batch_padded.batch.keys()
+            ):
                 self.checkpoint_manager.sleep_replicas()
-                batch_reward = self._compute_reward_colocate(test_output_gen_batch_padded)
-                test_output_gen_batch_padded = test_output_gen_batch_padded.union(batch_reward)
+                batch_reward = self._compute_reward_colocate(
+                    test_output_gen_batch_padded
+                )
+                test_output_gen_batch_padded = test_output_gen_batch_padded.union(
+                    batch_reward
+                )
                 self.checkpoint_manager.update_weights(self.global_steps)
 
-            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+            test_output_gen_batch = unpad_dataproto(
+                test_output_gen_batch_padded, pad_size=pad_size
+            )
 
             print("validation generation end")
 
             output_ids = test_output_gen_batch.batch["responses"]
-            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+            output_texts = [
+                self.tokenizer.decode(ids, skip_special_tokens=True)
+                for ids in output_ids
+            ]
             sample_outputs.extend(output_texts)
 
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
 
             input_ids = test_batch.batch["prompts"]
-            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+            input_texts = [
+                self.tokenizer.decode(ids, skip_special_tokens=True)
+                for ids in input_ids
+            ]
             sample_inputs.extend(input_texts)
             sample_uids.extend(test_batch.non_tensor_batch["uid"])
 
@@ -1059,29 +1194,33 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
             if val_traj_dir:
                 batch_uids = test_batch.non_tensor_batch["uid"].tolist()
                 if "messages_full" in test_output_gen_batch.non_tensor_batch:
-                    batch_msgs = test_output_gen_batch.non_tensor_batch["messages_full"].tolist()
+                    batch_msgs = test_output_gen_batch.non_tensor_batch[
+                        "messages_full"
+                    ].tolist()
                 else:
                     batch_msgs = [None] * len(batch_uids)
                 if "gold_doc_ids" in test_output_gen_batch.non_tensor_batch:
-                    batch_gold = test_output_gen_batch.non_tensor_batch["gold_doc_ids"].tolist()
+                    batch_gold = test_output_gen_batch.non_tensor_batch[
+                        "gold_doc_ids"
+                    ].tolist()
                 else:
                     batch_gold = [None] * len(batch_uids)
                 if "gold_ids_mapped" in test_output_gen_batch.non_tensor_batch:
-                    batch_gold_mapped = (
-                        test_output_gen_batch.non_tensor_batch["gold_ids_mapped"].tolist()
-                    )
+                    batch_gold_mapped = test_output_gen_batch.non_tensor_batch[
+                        "gold_ids_mapped"
+                    ].tolist()
                 else:
                     batch_gold_mapped = [None] * len(batch_uids)
                 if "trajectories_recall" in test_output_gen_batch.non_tensor_batch:
-                    batch_traj_recall = (
-                        test_output_gen_batch.non_tensor_batch["trajectories_recall"].tolist()
-                    )
+                    batch_traj_recall = test_output_gen_batch.non_tensor_batch[
+                        "trajectories_recall"
+                    ].tolist()
                 else:
                     batch_traj_recall = [None] * len(batch_uids)
                 if "trajectories_ids" in test_output_gen_batch.non_tensor_batch:
-                    batch_traj_ids = (
-                        test_output_gen_batch.non_tensor_batch["trajectories_ids"].tolist()
-                    )
+                    batch_traj_ids = test_output_gen_batch.non_tensor_batch[
+                        "trajectories_ids"
+                    ].tolist()
                 else:
                     batch_traj_ids = [None] * len(batch_uids)
                 traj_uids.extend(batch_uids)
@@ -1103,16 +1242,22 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
                 if isinstance(values, np.ndarray):
                     reward_extra_infos_dict[key].extend(values.tolist())
                 else:
-                    reward_extra_infos_dict[key].extend(values if isinstance(values, list) else [values])
+                    reward_extra_infos_dict[key].extend(
+                        values if isinstance(values, list) else [values]
+                    )
 
             if "__num_turns__" in test_batch.non_tensor_batch:
                 sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
 
             data_source_lst.append(
-                test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0])
+                test_batch.non_tensor_batch.get(
+                    "data_source", ["unknown"] * reward_tensor.shape[0]
+                )
             )
 
-        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+        self._maybe_log_val_generations(
+            inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores
+        )
 
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
         if val_data_dir:
@@ -1139,9 +1284,9 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
             )
 
         for key_info, lst in reward_extra_infos_dict.items():
-            assert len(lst) == 0 or len(lst) == len(sample_scores), (
-                f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
-            )
+            assert len(lst) == 0 or len(lst) == len(
+                sample_scores
+            ), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
 
         if merged:
             print("_merge_validation_results validate result will be merged")
@@ -1152,7 +1297,9 @@ class FilterGroupsRayPPOTrainer(RayPPOTrainer):
                 "reward_extra_infos_dict": reward_extra_infos_dict,
             }
         data_sources = np.concatenate(data_source_lst, axis=0)
-        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        return self._val_metrics_update(
+            data_sources, sample_uids, reward_extra_infos_dict, sample_turns
+        )
 
     def _dump_val_trajectories(
         self,

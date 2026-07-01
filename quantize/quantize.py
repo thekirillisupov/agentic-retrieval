@@ -63,10 +63,22 @@ def main() -> None:
         required=True,
         help="HF checkpoint dir (merged actor, e.g. .../actor/huggingface) or hub id.",
     )
-    ap.add_argument(
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument(
         "--questions",
-        required=True,
-        help="Generated calibration questions (.jsonl/.json/.txt/.parquet).",
+        help="Generated calibration questions (.jsonl/.json/.txt/.parquet with a "
+        "'question' column). Single-turn [system, user] prompts are rendered via "
+        "agent/prompts.py at calibration time.",
+    )
+    src.add_argument(
+        "--trajectories",
+        help="Pre-recorded trajectory file for higher-fidelity calibration. "
+        "Accepted formats:\n"
+        "  • grpo_train.parquet — reads the 'prompt' column (already-formatted "
+        "[system, user] arrays) with prompt_version from extra_info per row.\n"
+        "  • trajectories_data/*.jsonl — reads 'messages_full' (full multi-turn "
+        "rollouts: system + user + tool-calls + tool-results + final answer). "
+        "Higher fidelity for W8A8: activates MoE experts seen during reasoning.",
     )
     ap.add_argument(
         "--output",
@@ -74,6 +86,18 @@ def main() -> None:
         help="Where to write the compressed-tensors checkpoint.",
     )
     ap.add_argument("--question-field", default="question")
+    ap.add_argument(
+        "--trajectory-messages-field",
+        default="messages_full",
+        help="Field name for full message arrays in trajectory JSONL "
+        "(default: 'messages_full'). Ignored for parquet trajectories.",
+    )
+    ap.add_argument(
+        "--trajectory-prompt-field",
+        default="prompt",
+        help="Column name for message arrays in trajectory parquet "
+        "(default: 'prompt'). Ignored for JSONL trajectories.",
+    )
     ap.add_argument(
         "--prompt-version",
         default="v2_search_only",
@@ -127,7 +151,14 @@ def main() -> None:
     from llmcompressor import oneshot
     from llmcompressor.modifiers.quantization import GPTQModifier, QuantizationModifier
 
-    from quantize.calibration import build_calibration_dataset, load_questions
+    from quantize.calibration import (
+        build_calibration_dataset,
+        build_calibration_from_messages,
+        load_messages_from_trajectory_jsonl,
+        load_messages_from_trajectory_parquet,
+        load_questions,
+    )
+    from quantize.vllm_config import wrap_saved_config_for_vllm
 
     print(f"[quantize] loading model: {args.model}")
     model = AutoModelForCausalLM.from_pretrained(
@@ -149,16 +180,47 @@ def main() -> None:
         )
         oneshot(model=model, recipe=recipe)
     else:
-        questions = load_questions(args.questions, field=args.question_field)
-        print(f"[quantize] loaded {len(questions)} calibration questions")
-        ds = build_calibration_dataset(
-            questions,
-            tokenizer,
-            prompt_version=args.prompt_version,
-            num_samples=args.num_samples,
-            max_seq_len=args.max_seq_len,
-            seed=args.seed,
-        )
+        if args.trajectories:
+            traj_path = Path(args.trajectories)
+            suffix = traj_path.suffix.lower()
+            if suffix == ".parquet":
+                traj_msgs = load_messages_from_trajectory_parquet(
+                    traj_path,
+                    prompt_field=args.trajectory_prompt_field,
+                    default_prompt_version=args.prompt_version,
+                )
+                # Parquet prompts are single-turn [system, user] — match inference
+                # template with add_generation_prompt=True.
+                add_gen_prompt = True
+            else:
+                # JSONL: full multi-turn rollouts (messages_full).
+                traj_msgs = load_messages_from_trajectory_jsonl(
+                    traj_path,
+                    messages_field=args.trajectory_messages_field,
+                    default_prompt_version=args.prompt_version,
+                )
+                # Complete trajectories: no generation prompt needed.
+                add_gen_prompt = False
+            print(f"[quantize] loaded {len(traj_msgs)} trajectory samples")
+            ds = build_calibration_from_messages(
+                traj_msgs,
+                tokenizer,
+                num_samples=args.num_samples,
+                max_seq_len=args.max_seq_len,
+                add_generation_prompt=add_gen_prompt,
+                seed=args.seed,
+            )
+        else:
+            questions = load_questions(args.questions, field=args.question_field)
+            print(f"[quantize] loaded {len(questions)} calibration questions")
+            ds = build_calibration_dataset(
+                questions,
+                tokenizer,
+                prompt_version=args.prompt_version,
+                num_samples=args.num_samples,
+                max_seq_len=args.max_seq_len,
+                seed=args.seed,
+            )
         modifiers: list = []
         if args.smoothquant:
             # Opt-in only: see #2059 warning on --smoothquant. Shares the ignore
@@ -176,6 +238,9 @@ def main() -> None:
                 scheme=args.scheme,
                 ignore=IGNORE,
                 dampening_frac=args.dampening_frac,
+                # Channel-wise W8A8/W8A16 has no g_idx; GPTQ's default actorder=static
+                # is only valid with group quantization and breaks vLLM on reload.
+                actorder=None,
             )
         )
         oneshot(
@@ -191,6 +256,7 @@ def main() -> None:
     print(f"[quantize] saving compressed checkpoint -> {out}")
     model.save_pretrained(str(out), save_compressed=True)
     tokenizer.save_pretrained(str(out))
+    wrap_saved_config_for_vllm(out, args.model)
     print("[quantize] done. Serve with scripts/serve_vllm_int8.sh")
 
 

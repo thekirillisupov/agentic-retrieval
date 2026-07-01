@@ -27,6 +27,7 @@ CUDA_VISIBLE_DEVICES="${GPUS}" vllm serve "${MODEL}" \
   --max-model-len "${MAX_LEN}" \
   --max-num-seqs "${MAX_NUM_SEQS}" \
   --gpu-memory-utilization "${GPU_MEM_UTIL}" \
+  --limit-mm-per-prompt '{"image": 0, "video": 0}' \
   --enable-auto-tool-choice \
   --tool-call-parser "${TOOL_CALL_PARSER}" \
   --reasoning-parser "${REASONING_PARSER}" \
