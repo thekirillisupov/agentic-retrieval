@@ -126,6 +126,7 @@ def create_app(config_path: str | None = None) -> FastAPI:
             search_path=endpoints.get("search", "/local_search"),
             grep_path=endpoints.get("grep", "/grep"),
             neighbours_path=endpoints.get("get_neighbours", "/get_neighbours"),
+            response_schema=search_cfg.get("response"),
         )
 
     @app.get("/healthz")

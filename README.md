@@ -119,6 +119,12 @@ curl -s localhost:8080/retrieve -H 'content-type: application/json' -d '{
 its own tool set, so this also switches which tools the model is offered. `GET
 /prompts` lists the available versions.
 
+If your external service names its response fields differently (e.g. `{"id":
+..., "chunk": ..., "relevance": ...}`), map them under `search.response` in the
+config (`fields: {doc_id: id, text: chunk, score: relevance}`, plus
+`results_key`/`status_key`/`total_matches_key`). Defaults reproduce the in-repo
+tool server, so the block is optional.
+
 Config lives in [`configs/inference.yaml`](./configs/inference.yaml); `VLLM_URL`,
 `MODEL_NAME`, `SEARCH_URL` override it at runtime. `agent.prompt_version`,
 `use_id_map`, `tool_budget_feedback` and `max_tool_calls` must match the config

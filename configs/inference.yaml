@@ -27,6 +27,23 @@ search:
     search: /local_search
     grep: /grep
     get_neighbours: /get_neighbours
+  # How to read the search / get_neighbours JSON response. Defaults below match
+  # the in-repo tool server, so this whole block is optional — set it only if
+  # your service names things differently.
+  response:
+    results_key: results            # top-level list of result items
+    status_key: status              # get_neighbours: "ok"/"unknown_doc"/…
+    total_matches_key: total_matches  # grep: total hit count
+    # canonical field the harness needs -> field name in each result item.
+    # e.g. if your service returns {"id": ..., "chunk": ..., "relevance": ...}:
+    #   fields: {doc_id: id, text: chunk, score: relevance}
+    fields:
+      doc_id: doc_id
+      title: title
+      text: text
+      score: score
+      file_name: file_name
+      index: index
 
 agent:
   # v2 = search + get_neighbours (matches the trained tool set). max_tool_calls,

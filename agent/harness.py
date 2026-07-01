@@ -7,6 +7,7 @@ import json
 import logging
 import time
 import uuid
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -36,6 +37,89 @@ from agent.schemas import (
 log = logging.getLogger(__name__)
 
 
+def _default_result_fields() -> dict[str, str]:
+    # Canonical field the harness needs -> field name in the external response
+    # item. Identity by default (matches the in-repo tool server).
+    return {
+        "doc_id": "doc_id",
+        "title": "title",
+        "text": "text",
+        "score": "score",
+        "file_name": "file_name",
+        "index": "index",
+    }
+
+
+@dataclass
+class ResponseSchema:
+    """Maps an external search/get_neighbours JSON response into the canonical
+    shape the harness consumes.
+
+    The harness expects, from every retrieval response, a top-level list of
+    result items each carrying ``doc_id``/``title``/``text``/``score`` (plus
+    optional ``file_name``/``index``), and — for grep/get_neighbours — top-level
+    ``total_matches``/``status``. When an external service names those keys
+    differently, configure the mapping under ``search.response`` in the config;
+    the defaults reproduce the in-repo tool server exactly, so unset config = no
+    change.
+    """
+
+    results_key: str = "results"
+    status_key: str = "status"
+    total_matches_key: str = "total_matches"
+    fields: dict[str, str] = field(default_factory=_default_result_fields)
+
+    @classmethod
+    def from_config(cls, cfg: dict[str, Any] | None) -> "ResponseSchema":
+        if not cfg:
+            return cls()
+        merged = _default_result_fields()
+        merged.update(cfg.get("fields") or {})
+        base = cls()
+        return cls(
+            results_key=cfg.get("results_key", base.results_key),
+            status_key=cfg.get("status_key", base.status_key),
+            total_matches_key=cfg.get("total_matches_key", base.total_matches_key),
+            fields=merged,
+        )
+
+    def _item(self, raw: dict[str, Any]) -> dict[str, Any]:
+        f = self.fields
+        doc_id_key = f.get("doc_id", "doc_id")
+        if doc_id_key not in raw:
+            raise KeyError(
+                f"result item missing doc_id field {doc_id_key!r}; keys={list(raw)}"
+            )
+        out: dict[str, Any] = {
+            "doc_id": raw[doc_id_key],
+            # Defaulted so rendering never KeyErrors on services that omit them;
+            # score is unused for grep/neighbours, 0.0 is a harmless sentinel.
+            "title": raw.get(f.get("title", "title"), ""),
+            "text": raw.get(f.get("text", "text"), ""),
+            "score": raw.get(f.get("score", "score"), 0.0),
+        }
+        file_name = raw.get(f.get("file_name", "file_name"))
+        if file_name is not None:
+            out["file_name"] = file_name
+        index = raw.get(f.get("index", "index"))
+        if index is not None:
+            out["index"] = index
+        return out
+
+    def normalize(self, response: dict[str, Any]) -> dict[str, Any]:
+        """Return ``response`` with its result list + status/total_matches
+        rewritten under canonical keys (extra top-level keys are preserved)."""
+        items = response.get(self.results_key) or []
+        out = dict(response)
+        results = [self._item(r) for r in items]
+        out["results"] = results
+        out["status"] = str(response.get(self.status_key, "ok"))
+        out["total_matches"] = int(
+            response.get(self.total_matches_key, len(results))
+        )
+        return out
+
+
 class ToolServerClient:
     """Thin httpx wrapper around the tool server.
 
@@ -51,6 +135,7 @@ class ToolServerClient:
         search_path: str = "/local_search",
         grep_path: str = "/grep",
         neighbours_path: str = "/get_neighbours",
+        response_schema: dict[str, Any] | None = None,
     ) -> None:
         self.url = url.rstrip("/")
         # Endpoint paths are configurable so the same harness can drive an
@@ -59,6 +144,8 @@ class ToolServerClient:
         self.search_path = "/" + search_path.lstrip("/")
         self.grep_path = "/" + grep_path.lstrip("/")
         self.neighbours_path = "/" + neighbours_path.lstrip("/")
+        # Response field mapping; defaults reproduce the in-repo tool server.
+        self.schema = ResponseSchema.from_config(response_schema)
         self.client = httpx.Client(timeout=timeout_s)
 
     @staticmethod
@@ -89,7 +176,7 @@ class ToolServerClient:
             payload["source"] = source
         r = self.client.post(f"{self.url}{self.search_path}", json=payload)
         r.raise_for_status()
-        return r.json()
+        return self.schema.normalize(r.json())
 
     def grep(
         self,
@@ -103,7 +190,7 @@ class ToolServerClient:
             payload["source"] = source
         r = self.client.post(f"{self.url}{self.grep_path}", json=payload)
         r.raise_for_status()
-        return r.json()
+        return self.schema.normalize(r.json())
 
     def get_neighbours(
         self,
@@ -117,7 +204,7 @@ class ToolServerClient:
             payload["source"] = source
         r = self.client.post(f"{self.url}{self.neighbours_path}", json=payload)
         r.raise_for_status()
-        return r.json()
+        return self.schema.normalize(r.json())
 
     def close(self) -> None:
         self.client.close()
