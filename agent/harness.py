@@ -215,8 +215,8 @@ class AgentHarness:
         self,
         *,
         model: str,
-        vllm_url: str,
-        api_key: str,
+        vllm_url: str | None = None,
+        api_key: str = "EMPTY",
         tool_client: ToolServerClient,
         prompt_version: str = "v1",
         max_tokens: int = 4096,
@@ -225,9 +225,16 @@ class AgentHarness:
         top_k_max: int = 50,
         use_id_map: bool = False,
         tool_budget_feedback: bool = False,
+        model_client: Any | None = None,
     ) -> None:
         self.model = model
-        self.client = OpenAI(base_url=vllm_url, api_key=api_key)
+        # A prebuilt client (e.g. an http backend behind mTLS) wins; otherwise
+        # default to a vLLM / OpenAI-compatible client from vllm_url. Any client
+        # exposing ``.chat.completions.create`` in the OpenAI shape works.
+        if model_client is not None:
+            self.client = model_client
+        else:
+            self.client = OpenAI(base_url=vllm_url, api_key=api_key)
         self.tool_client = tool_client
         self.prompt_version = prompt_version
         self.max_tokens = max_tokens

@@ -31,6 +31,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from agent.harness import AgentHarness, ToolServerClient
+from agent.model_client import build_model_client
 from agent.prompts import PROFILES
 from agent.schemas import AgentInput, Message
 
@@ -119,6 +120,10 @@ def create_app(config_path: str | None = None) -> FastAPI:
     agent_cfg = cfg["agent"]
     endpoints = search_cfg.get("endpoints", {}) or {}
 
+    # Built once (backend config is static) and reused across requests: an
+    # OpenAI/vLLM client or an http backend (raw endpoint behind mTLS).
+    model_client = build_model_client(model_cfg)
+
     def _make_tool_client() -> ToolServerClient:
         return ToolServerClient(
             search_cfg["url"],
@@ -155,9 +160,8 @@ def create_app(config_path: str | None = None) -> FastAPI:
         tool = _make_tool_client()
         harness = AgentHarness(
             model=model_cfg["name"],
-            vllm_url=model_cfg["vllm_url"],
-            api_key=model_cfg.get("api_key", "EMPTY"),
             tool_client=tool,
+            model_client=model_client,
             prompt_version=pv,
             max_tokens=int(model_cfg.get("max_tokens", 4096)),
             temperature=float(model_cfg.get("temperature", 0.6)),

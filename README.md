@@ -119,6 +119,14 @@ curl -s localhost:8080/retrieve -H 'content-type: application/json' -d '{
 its own tool set, so this also switches which tools the model is offered. `GET
 /prompts` lists the available versions.
 
+The model backend is switchable under `model.backend`: `openai` (this image's
+local vLLM, or any OpenAI-compatible server — optionally behind mutual TLS via
+`model.tls`) or `http` (a raw JSON endpoint). For `http`, set `model.url` and
+the `extra_body` (`top_p`, `reasoning`, `chat_template_kwargs`, …) and `model.tls`
+(`cert_file`/`key_file`/`verify`) to mirror your curl. The agent loop needs
+tool-calling, so an `http` endpoint must accept `tools`/`tool_choice` and return
+OpenAI-style `tool_calls` (keep `send_tools: true`).
+
 If your external service names its response fields differently (e.g. `{"id":
 ..., "chunk": ..., "relevance": ...}`), map them under `search.response` in the
 config (`fields: {doc_id: id, text: chunk, score: relevance}`, plus

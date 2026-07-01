@@ -7,6 +7,10 @@
 # Env overrides applied by agent/service.py: VLLM_URL, MODEL_NAME, SEARCH_URL.
 
 model:
+  # Which backend serves the model:
+  #   openai -> vLLM / OpenAI-compatible server (this image's local vLLM)
+  #   http   -> a raw JSON endpoint (see the commented block below)
+  backend: openai
   # Must match vLLM's --served-model-name (see docker/entrypoint.inference.sh),
   # NOT the on-disk weight path, so the harness is decoupled from the mount point.
   name: agentic-retrieval
@@ -14,6 +18,30 @@ model:
   api_key: EMPTY
   max_tokens: 4096
   temperature: 0.6
+  # Mutual TLS also applies to the openai backend (OpenAI API behind mTLS):
+  # tls:
+  #   cert_file: published.pem
+  #   key_file: 00CA0001CLLMl99usr.key
+  #   verify: false            # curl --insecure; or a CA-bundle path
+
+  # --- Alternative: call an external model over a raw JSON endpoint ---
+  # Set backend: http and fill these in. The body mirrors your curl; the agent
+  # loop needs tool-calling, so the endpoint must accept tools/tool_choice and
+  # return OpenAI-style tool_calls (keep send_tools: true).
+  # backend: http
+  # url: https://sm.apps.../qwen_35
+  # timeout_s: 120
+  # include_model: false       # the sample curl omits "model"
+  # send_tools: true           # forward tools/tool_choice (required for search)
+  # extra_body:                # merged into every request body
+  #   top_p: 0.95
+  #   reasoning: false
+  #   chat_template_kwargs:
+  #     enable_thinking: false
+  # tls:
+  #   cert_file: published.pem            # curl --cert
+  #   key_file: 00CA0001CLLMl99usr.key    # curl --key
+  #   verify: false                       # curl --insecure
 
 search:
   # Base URL of your external retrieval service (embedder + reranker + index).
