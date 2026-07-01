@@ -43,37 +43,79 @@ class ToolServerClient:
     the server's Python module — it only needs the URL.
     """
 
-    def __init__(self, url: str, timeout_s: float = 30.0) -> None:
+    def __init__(
+        self,
+        url: str,
+        timeout_s: float = 30.0,
+        *,
+        search_path: str = "/local_search",
+        grep_path: str = "/grep",
+        neighbours_path: str = "/get_neighbours",
+    ) -> None:
         self.url = url.rstrip("/")
+        # Endpoint paths are configurable so the same harness can drive an
+        # external retrieval service whose route names differ (e.g. `/search`
+        # instead of `/local_search`). Defaults preserve the in-repo tool server.
+        self.search_path = "/" + search_path.lstrip("/")
+        self.grep_path = "/" + grep_path.lstrip("/")
+        self.neighbours_path = "/" + neighbours_path.lstrip("/")
         self.client = httpx.Client(timeout=timeout_s)
 
-    def local_search(
-        self, query: str, top_k: int, source: str | None = None
+    @staticmethod
+    def _merge(
+        base: dict[str, Any], extra_params: dict[str, Any] | None
     ) -> dict[str, Any]:
-        payload: dict[str, Any] = {"query": query, "top_k": top_k}
+        """Merge caller-supplied passthrough params under the harness-owned keys.
+
+        ``extra_params`` are extra retrieval knobs the *caller* pins for the
+        whole episode (filters, corpus routing, top_k caps, …). The harness-owned
+        keys (query/pattern/doc_id/top_k/window/source) are applied last so the
+        model-controlled query always wins — mirroring how the agent was trained:
+        the model decides *what* to search, the caller decides *how*.
+        """
+        payload: dict[str, Any] = dict(extra_params or {})
+        payload.update(base)
+        return payload
+
+    def local_search(
+        self,
+        query: str,
+        top_k: int,
+        source: str | None = None,
+        extra_params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload = self._merge({"query": query, "top_k": top_k}, extra_params)
         if source:
             payload["source"] = source
-        r = self.client.post(f"{self.url}/local_search", json=payload)
+        r = self.client.post(f"{self.url}{self.search_path}", json=payload)
         r.raise_for_status()
         return r.json()
 
     def grep(
-        self, pattern: str, top_k: int, source: str | None = None
+        self,
+        pattern: str,
+        top_k: int,
+        source: str | None = None,
+        extra_params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        payload: dict[str, Any] = {"pattern": pattern, "top_k": top_k}
+        payload = self._merge({"pattern": pattern, "top_k": top_k}, extra_params)
         if source:
             payload["source"] = source
-        r = self.client.post(f"{self.url}/grep", json=payload)
+        r = self.client.post(f"{self.url}{self.grep_path}", json=payload)
         r.raise_for_status()
         return r.json()
 
     def get_neighbours(
-        self, doc_id: str, window: int, source: str | None = None
+        self,
+        doc_id: str,
+        window: int,
+        source: str | None = None,
+        extra_params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        payload: dict[str, Any] = {"doc_id": doc_id, "window": window}
+        payload = self._merge({"doc_id": doc_id, "window": window}, extra_params)
         if source:
             payload["source"] = source
-        r = self.client.post(f"{self.url}/get_neighbours", json=payload)
+        r = self.client.post(f"{self.url}{self.neighbours_path}", json=payload)
         r.raise_for_status()
         return r.json()
 
@@ -240,6 +282,7 @@ class AgentHarness:
                         agent_input.source,
                         id_map=id_map if _use_id_map else None,
                         id_map_inv=id_map_inv if _use_id_map else None,
+                        search_params=agent_input.search_params,
                     )
                     num_tool_calls += 1
                     if self.tool_budget_feedback:
@@ -341,6 +384,7 @@ class AgentHarness:
         pinned_source: str | None = None,
         id_map: dict[str, int] | None = None,
         id_map_inv: list[str] | None = None,
+        search_params: dict[str, Any] | None = None,
     ) -> tuple[Message, ToolCallTrace]:
         name = tc.function.name
         try:
@@ -376,7 +420,8 @@ class AgentHarness:
             fetch_k = min(top_k + len(seen), self.top_k_max)
             try:
                 response = self.tool_client.local_search(
-                    query=query, top_k=fetch_k, source=source
+                    query=query, top_k=fetch_k, source=source,
+                    extra_params=search_params,
                 )
             except Exception as e:
                 latency_ms = int((time.perf_counter() - t0) * 1000)
@@ -442,7 +487,8 @@ class AgentHarness:
             top_k = max(1, min(top_k, self.top_k_max))
             try:
                 response = self.tool_client.grep(
-                    pattern=pattern, top_k=top_k, source=source
+                    pattern=pattern, top_k=top_k, source=source,
+                    extra_params=search_params,
                 )
             except Exception as e:
                 latency_ms = int((time.perf_counter() - t0) * 1000)
@@ -509,7 +555,8 @@ class AgentHarness:
 
             try:
                 response = self.tool_client.get_neighbours(
-                    doc_id=doc_id_arg, window=window, source=source
+                    doc_id=doc_id_arg, window=window, source=source,
+                    extra_params=search_params,
                 )
             except Exception as e:
                 latency_ms = int((time.perf_counter() - t0) * 1000)

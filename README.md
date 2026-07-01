@@ -84,6 +84,42 @@ bash scripts/train_grpo.sh                     # veRL spins up its own rollout v
 Full design + spec→implementation map + open caveats live in
 [`GRPO_README.md`](./GRPO_README.md).
 
+## Inference image
+
+Self-contained image that serves the quantized actor + the ReAct harness as a
+single HTTP endpoint. Embedder / reranker / index are **not** included — the
+harness calls an external `search` service (`SEARCH_URL`).
+
+```
+[vLLM :8000 OpenAI API] <--local--> [harness /retrieve :8080] --> external SEARCH_URL
+```
+
+```bash
+# Build (lean; weights are NOT baked in)
+docker build -f Dockerfile.inference -t agentic-retrieval:infer .
+
+# Run — mount the W8A8 weights, point at your external search service
+docker run --gpus all -p 8080:8080 \
+  -v "$PWD/checkpoints/quantized/qwen3_5_35b_a3b_w8a8:/models/qwen3_5_35b_a3b_w8a8:ro" \
+  -e SEARCH_URL=http://your-search-host:8100 \
+  agentic-retrieval:infer
+
+# Call the agent: pass the dialogue + pinned retrieval params; the model only
+# decides the query for each search / get_neighbours call.
+curl -s localhost:8080/retrieve -H 'content-type: application/json' -d '{
+  "messages": [{"role": "user", "content": "who directed the sequel to Alien?"}],
+  "source": "ckr",
+  "search_params": {}
+}'
+```
+
+Config lives in [`configs/inference.yaml`](./configs/inference.yaml); `VLLM_URL`,
+`MODEL_NAME`, `SEARCH_URL` override it at runtime. `agent.prompt_version`,
+`use_id_map`, `tool_budget_feedback` and `max_tool_calls` must match the config
+the weights were trained/quantized with. Route names on the external service are
+configurable under `search.endpoints` (default `/local_search`). For a
+harness-only deployment (separate vLLM) use `scripts/serve_agent.sh`.
+
 ## Experiments
 
 enable_thinking=false agent n=200 ndcg@10=0.4750 recall@10=0.4275 avg_calls=2.88

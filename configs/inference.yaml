@@ -1,0 +1,45 @@
+# Inference config for the agentic-retrieval image.
+#
+# Only what the harness needs at serving time: how to reach the local vLLM, how
+# to reach the EXTERNAL search service, and the agent knobs. No embedder /
+# reranker / faiss sections — those live behind the external `search` endpoint.
+#
+# Env overrides applied by agent/service.py: VLLM_URL, MODEL_NAME, SEARCH_URL.
+
+model:
+  # Must match vLLM's --served-model-name (see docker/entrypoint.inference.sh),
+  # NOT the on-disk weight path, so the harness is decoupled from the mount point.
+  name: agentic-retrieval
+  vllm_url: http://localhost:8000/v1
+  api_key: EMPTY
+  max_tokens: 4096
+  temperature: 0.6
+
+search:
+  # Base URL of your external retrieval service (embedder + reranker + index).
+  # Override at runtime with SEARCH_URL. The model only fills the query; the
+  # caller pins everything else via the request's `search_params`.
+  url: http://localhost:8100
+  timeout_s: 30
+  # Route names on the external service. Defaults match the in-repo tool server;
+  # point `search` at your `/search` handler if that's how yours is named.
+  endpoints:
+    search: /local_search
+    grep: /grep
+    get_neighbours: /get_neighbours
+
+agent:
+  # v2 = search + get_neighbours (matches the trained tool set). max_tool_calls,
+  # use_id_map and tool_budget_feedback MUST match the training/eval config the
+  # weights were produced with (mirrors configs/ckr.yaml).
+  prompt_version: v2
+  max_turns: 8
+  max_tool_calls: 3
+  top_k_default: 8
+  top_k_max: 50
+  use_id_map: true
+  tool_budget_feedback: true
+
+service:
+  host: 0.0.0.0
+  port: 8080
