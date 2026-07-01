@@ -84,6 +84,62 @@ bash scripts/train_grpo.sh                     # veRL spins up its own rollout v
 Full design + spec→implementation map + open caveats live in
 [`GRPO_README.md`](./GRPO_README.md).
 
+## Inference image
+
+Self-contained image that serves the quantized actor + the ReAct harness as a
+single HTTP endpoint. Embedder / reranker / index are **not** included — the
+harness calls an external `search` service (`SEARCH_URL`).
+
+```
+[vLLM :8000 OpenAI API] <--local--> [harness /retrieve :8080] --> external SEARCH_URL
+```
+
+```bash
+# Build (lean; weights are NOT baked in)
+docker build -f Dockerfile.inference -t agentic-retrieval:infer .
+
+# Run — mount the W8A8 weights, point at your external search service
+docker run --gpus all -p 8080:8080 \
+  -v "$PWD/checkpoints/quantized/qwen3_5_35b_a3b_w8a8:/models/qwen3_5_35b_a3b_w8a8:ro" \
+  -e SEARCH_URL=http://your-search-host:8100 \
+  agentic-retrieval:infer
+
+# Call the agent: pass the dialogue + retrieval params (index routing, filters,
+# … — everything except the query). The model only decides the query text for
+# each search / get_neighbours call.
+curl -s localhost:8080/retrieve -H 'content-type: application/json' -d '{
+  "messages": [{"role": "user", "content": "who directed the sequel to Alien?"}],
+  "search_params": {},
+  "prompt_version": "v2"
+}'
+```
+
+`prompt_version` is per-request (falls back to the config default): `v2`
+(search + get_neighbours) or `v2_search_only` (search only). Each profile fixes
+its own tool set, so this also switches which tools the model is offered. `GET
+/prompts` lists the available versions.
+
+The model backend is switchable under `model.backend`: `openai` (this image's
+local vLLM, or any OpenAI-compatible server — optionally behind mutual TLS via
+`model.tls`) or `http` (a raw JSON endpoint). For `http`, set `model.url` and
+the `extra_body` (`top_p`, `reasoning`, `chat_template_kwargs`, …) and `model.tls`
+(`cert_file`/`key_file`/`verify`) to mirror your curl. The agent loop needs
+tool-calling, so an `http` endpoint must accept `tools`/`tool_choice` and return
+OpenAI-style `tool_calls` (keep `send_tools: true`).
+
+If your external service names its response fields differently (e.g. `{"id":
+..., "chunk": ..., "relevance": ...}`), map them under `search.response` in the
+config (`fields: {doc_id: id, text: chunk, score: relevance}`, plus
+`results_key`/`status_key`/`total_matches_key`). Defaults reproduce the in-repo
+tool server, so the block is optional.
+
+Config lives in [`configs/inference.yaml`](./configs/inference.yaml); `VLLM_URL`,
+`MODEL_NAME`, `SEARCH_URL` override it at runtime. `agent.prompt_version`,
+`use_id_map`, `tool_budget_feedback` and `max_tool_calls` must match the config
+the weights were trained/quantized with. Route names on the external service are
+configurable under `search.endpoints` (default `/local_search`). For a
+harness-only deployment (separate vLLM) use `scripts/serve_agent.sh`.
+
 ## Experiments
 
 enable_thinking=false agent n=200 ndcg@10=0.4750 recall@10=0.4275 avg_calls=2.88

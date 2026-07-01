@@ -77,6 +77,12 @@ class AgentInput:
     # index (per-row routing). None -> tool server's default_source. A `source`
     # explicitly emitted by the model in a tool call overrides this.
     source: str | None = None
+    # Extra retrieval knobs the caller pins for the whole episode (filters, top_k
+    # caps, corpus routing, …). Forwarded verbatim to every search/grep/
+    # get_neighbours request; the harness-owned keys (query, top_k, source, …)
+    # override them so the model still controls *what* to search. Empty by
+    # default -> no behaviour change for existing callers.
+    search_params: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

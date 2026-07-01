@@ -1,0 +1,90 @@
+# Inference config for the agentic-retrieval image.
+#
+# Only what the harness needs at serving time: how to reach the local vLLM, how
+# to reach the EXTERNAL search service, and the agent knobs. No embedder /
+# reranker / faiss sections — those live behind the external `search` endpoint.
+#
+# Env overrides applied by agent/service.py: VLLM_URL, MODEL_NAME, SEARCH_URL.
+
+model:
+  # Which backend serves the model:
+  #   openai -> vLLM / OpenAI-compatible server (this image's local vLLM)
+  #   http   -> a raw JSON endpoint (see the commented block below)
+  backend: openai
+  # Must match vLLM's --served-model-name (see docker/entrypoint.inference.sh),
+  # NOT the on-disk weight path, so the harness is decoupled from the mount point.
+  name: agentic-retrieval
+  vllm_url: http://localhost:8000/v1
+  api_key: EMPTY
+  max_tokens: 4096
+  temperature: 0.6
+  # Mutual TLS also applies to the openai backend (OpenAI API behind mTLS):
+  # tls:
+  #   cert_file: published.pem
+  #   key_file: 00CA0001CLLMl99usr.key
+  #   verify: false            # curl --insecure; or a CA-bundle path
+
+  # --- Alternative: call an external model over a raw JSON endpoint ---
+  # Set backend: http and fill these in. The body mirrors your curl; the agent
+  # loop needs tool-calling, so the endpoint must accept tools/tool_choice and
+  # return OpenAI-style tool_calls (keep send_tools: true).
+  # backend: http
+  # url: https://sm.apps.../qwen_35
+  # timeout_s: 120
+  # include_model: false       # the sample curl omits "model"
+  # send_tools: true           # forward tools/tool_choice (required for search)
+  # extra_body:                # merged into every request body
+  #   top_p: 0.95
+  #   reasoning: false
+  #   chat_template_kwargs:
+  #     enable_thinking: false
+  # tls:
+  #   cert_file: published.pem            # curl --cert
+  #   key_file: 00CA0001CLLMl99usr.key    # curl --key
+  #   verify: false                       # curl --insecure
+
+search:
+  # Base URL of your external retrieval service (embedder + reranker + index).
+  # Override at runtime with SEARCH_URL. The model only fills the query; the
+  # caller pins everything else via the request's `search_params`.
+  url: http://localhost:8100
+  timeout_s: 30
+  # Route names on the external service. Defaults match the in-repo tool server;
+  # point `search` at your `/search` handler if that's how yours is named.
+  endpoints:
+    search: /local_search
+    grep: /grep
+    get_neighbours: /get_neighbours
+  # How to read the search / get_neighbours JSON response. Defaults below match
+  # the in-repo tool server, so this whole block is optional — set it only if
+  # your service names things differently.
+  response:
+    results_key: results            # top-level list of result items
+    status_key: status              # get_neighbours: "ok"/"unknown_doc"/…
+    total_matches_key: total_matches  # grep: total hit count
+    # canonical field the harness needs -> field name in each result item.
+    # e.g. if your service returns {"id": ..., "chunk": ..., "relevance": ...}:
+    #   fields: {doc_id: id, text: chunk, score: relevance}
+    fields:
+      doc_id: doc_id
+      title: title
+      text: text
+      score: score
+      file_name: file_name
+      index: index
+
+agent:
+  # v2 = search + get_neighbours (matches the trained tool set). max_tool_calls,
+  # use_id_map and tool_budget_feedback MUST match the training/eval config the
+  # weights were produced with (mirrors configs/ckr.yaml).
+  prompt_version: v2
+  max_turns: 8
+  max_tool_calls: 3
+  top_k_default: 8
+  top_k_max: 50
+  use_id_map: true
+  tool_budget_feedback: true
+
+service:
+  host: 0.0.0.0
+  port: 8080

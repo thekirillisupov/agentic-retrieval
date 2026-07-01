@@ -1,0 +1,53 @@
+# Lean inference image for agentic-retrieval.
+#
+# Ships the vLLM runtime + the agent harness HTTP service. Does NOT ship weights
+# (mount at runtime) and does NOT ship the embedder / reranker / faiss tool
+# server (those live behind an external `search` endpoint you point SEARCH_URL at).
+#
+# Build:
+#   docker build -f Dockerfile.inference -t agentic-retrieval:infer .
+#
+# Run (weights mounted, external search reachable):
+#   docker run --gpus all -p 8080:8080 \
+#     -v /path/to/checkpoints/quantized/qwen3_5_35b_a3b_w8a8:/models/qwen3_5_35b_a3b_w8a8:ro \
+#     -e SEARCH_URL=http://your-search-host:8100 \
+#     agentic-retrieval:infer
+#
+# Base is the official vLLM OpenAI image so the CUDA/torch/vLLM stack is the
+# tested one. Override for aarch64 / a different vLLM: --build-arg BASE_IMAGE=...
+ARG BASE_IMAGE=vllm/vllm-openai:v0.18.0
+FROM ${BASE_IMAGE}
+
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
+
+# curl: entrypoint health-probes vLLM before starting the harness.
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Harness-side deps. Most already ship in the vLLM image (openai, fastapi,
+# uvicorn, pydantic); pin the rest. --no-deps-free install is fine here.
+RUN pip install "httpx>=0.27" "pyyaml>=6" "uvicorn[standard]>=0.30" \
+    "fastapi>=0.110" "openai>=1.40"
+
+WORKDIR /app
+
+# Only the harness needs shipping — no tool_server/, eval_/, grpo/, etc.
+COPY agent/ /app/agent/
+COPY configs/inference.yaml /app/configs/inference.yaml
+COPY docker/entrypoint.inference.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+# Defaults; override at `docker run` time.
+ENV MODEL=/models/qwen3_5_35b_a3b_w8a8 \
+    SERVED_MODEL_NAME=agentic-retrieval \
+    AGENT_CONFIG=configs/inference.yaml \
+    VLLM_PORT=8000 \
+    AGENT_PORT=8080
+
+# 8000 = vLLM OpenAI API (internal), 8080 = harness /retrieve (public).
+EXPOSE 8000 8080
+
+ENTRYPOINT ["/app/entrypoint.sh"]
