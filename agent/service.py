@@ -85,11 +85,10 @@ class RetrieveRequest(BaseModel):
     # harness prepends its own system prompt and wraps user turns per the prompt
     # version, so callers pass raw conversation content.
     messages: list[ChatMessage]
-    # Corpus to pin every search to (per-conversation routing). None -> the
-    # external service's default.
-    source: str | None = None
-    # Extra retrieval knobs forwarded verbatim to the external search service
-    # (filters, top_k caps, …). The model still owns the query text.
+    # Extra retrieval knobs forwarded verbatim to the external search service:
+    # index routing, filters, top_k caps, … Everything except the query text.
+    # (Per-row `source` routing is a training-only concern; at inference the
+    # target index is selected here.) The model still owns the query.
     search_params: dict[str, Any] = Field(default_factory=dict)
     # Per-request overrides of the config defaults (all optional).
     max_turns: int | None = None
@@ -156,7 +155,8 @@ def create_app(config_path: str | None = None) -> FastAPI:
             or int(agent_cfg.get("max_tool_calls", 3)),
             top_k_default=req.top_k_default
             or int(agent_cfg.get("top_k_default", 10)),
-            source=req.source,
+            # No `source`: at inference the target index is carried in
+            # search_params, not pinned per-row (that was a training concern).
             search_params=req.search_params,
         )
 

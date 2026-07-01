@@ -104,11 +104,11 @@ docker run --gpus all -p 8080:8080 \
   -e SEARCH_URL=http://your-search-host:8100 \
   agentic-retrieval:infer
 
-# Call the agent: pass the dialogue + pinned retrieval params; the model only
-# decides the query for each search / get_neighbours call.
+# Call the agent: pass the dialogue + retrieval params (index routing, filters,
+# … — everything except the query). The model only decides the query text for
+# each search / get_neighbours call.
 curl -s localhost:8080/retrieve -H 'content-type: application/json' -d '{
   "messages": [{"role": "user", "content": "who directed the sequel to Alien?"}],
-  "source": "ckr",
   "search_params": {}
 }'
 ```
