@@ -247,6 +247,11 @@ agent_loop:
     tool_budget_feedback: true
     top_k_default: 5
     top_k_max: 50
+    # Per-passage cap (tokenizer token count), applied to each hit's text
+    # BEFORE max_tool_response_length's total-response char budget. Keeps any
+    # single long passage from crowding out the rest of top_k, and bounds the
+    # per-turn context growth deterministically. 0 disables.
+    max_passage_tokens: 512
     # max_response_tokens: 5120
     # Abort the rollout worker after this many consecutive tool-server failures
     # instead of silently returning empty results and degrading rewards.

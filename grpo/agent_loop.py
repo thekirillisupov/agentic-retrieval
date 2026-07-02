@@ -220,6 +220,39 @@ def _strip_internal_keys(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
     return [{k: v for k, v in m.items() if not k.startswith("_")} for m in messages]
 
 
+def _truncate_passage_texts(
+    results: list[dict[str, Any]],
+    tokenizer: Any,
+    max_tokens: int,
+) -> list[dict[str, Any]]:
+    """Cap each passage's ``text`` field at *max_tokens* tokens.
+
+    This is independent of ``max_tool_response_length``: that budget drops
+    *whole hits* to fit a total-response character budget, so a handful of
+    unusually long chunks can crowd out the rest of the requested top_k just
+    by being verbose. Truncating per-passage first means every hit costs a
+    bounded amount of context, and the total-response budget then only needs
+    to trim the *count* of hits, not silently mangle which ones survive.
+
+    No-op when *tokenizer* is unavailable or *max_tokens* <= 0.
+    """
+    if tokenizer is None or max_tokens <= 0:
+        return results
+    out: list[dict[str, Any]] = []
+    for r in results:
+        text = r.get("text")
+        if not isinstance(text, str) or not text:
+            out.append(r)
+            continue
+        ids = tokenizer.encode(text, add_special_tokens=False)
+        if len(ids) <= max_tokens:
+            out.append(r)
+            continue
+        truncated = tokenizer.decode(ids[:max_tokens], skip_special_tokens=True)
+        out.append({**r, "text": truncated + " ...(truncated)"})
+    return out
+
+
 def _fitted_new_doc_ids(
     candidate_new_ids: list[str],
     fitted: list[dict[str, Any]],
@@ -297,6 +330,10 @@ class RetrievalReActAgentLoop(AgentLoopBase):
         self.tool_budget_feedback: bool = bool(_g("tool_budget_feedback", False))
         self.top_k_default = int(_g("top_k_default", 10))
         self.top_k_max = int(_g("top_k_max", 50))
+        # Per-passage token cap applied to each hit's `text` BEFORE the
+        # total-response char budget (max_tool_response_length) is enforced.
+        # 0 disables (no per-passage truncation, old behaviour).
+        self.max_passage_tokens = int(_g("max_passage_tokens", 0))
         # Comma-separated list of tool names to expose, e.g. "local_search" or
         # "search,grep" for the extending prompt variant.
         _raw_tools = str(_g("tool_names", "local_search"))
@@ -503,6 +540,9 @@ class RetrievalReActAgentLoop(AgentLoopBase):
 
             self._record_tool_success()
             results = payload.get("results", [])
+            results = _truncate_passage_texts(
+                results, self.tokenizer, self.max_passage_tokens
+            )
             # Render the ranked hits in order, preserving the position of every
             # passage but optimising context: NEW docs are shown as full
             # passages, already-seen docs as id-only placeholders
@@ -614,6 +654,9 @@ class RetrievalReActAgentLoop(AgentLoopBase):
 
             self._record_tool_success()
             results = payload.get("results", [])
+            results = _truncate_passage_texts(
+                results, self.tokenizer, self.max_passage_tokens
+            )
             total_matches: int = payload.get("total_matches", len(results))
             if id_map is not None and id_map_inv is not None:
                 grep_display = [
@@ -692,6 +735,9 @@ class RetrievalReActAgentLoop(AgentLoopBase):
 
             self._record_tool_success()
             results = payload.get("results", [])
+            results = _truncate_passage_texts(
+                results, self.tokenizer, self.max_passage_tokens
+            )
             status = str(payload.get("status", "ok"))
             if id_map is not None and id_map_inv is not None:
                 nb_display = [

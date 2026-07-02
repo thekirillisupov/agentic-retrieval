@@ -29,6 +29,7 @@ CUDA_VISIBLE_DEVICES="${GPUS}" vllm serve "${MODEL}" \
   --gpu-memory-utilization "${GPU_MEM_UTIL}" \
   --limit-mm-per-prompt '{"image": 0, "video": 0}' \
   --enable-auto-tool-choice \
+  --enable-prefix-caching \
   --tool-call-parser "${TOOL_CALL_PARSER}" \
   --reasoning-parser "${REASONING_PARSER}" \
   --default-chat-template-kwargs "{\"enable_thinking\": ${ENABLE_THINKING}}" \
