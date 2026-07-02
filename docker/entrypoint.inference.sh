@@ -17,7 +17,7 @@ VLLM_PORT="${VLLM_PORT:-8000}"
 TP="${TP:-1}"
 MAX_LEN="${MAX_LEN:-32768}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-32}"
-GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.85}"
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.80}"
 TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-qwen3_xml}"
 REASONING_PARSER="${REASONING_PARSER:-qwen3}"
 ENABLE_THINKING="${ENABLE_THINKING:-false}"
@@ -59,6 +59,7 @@ vllm serve "${MODEL}" \
   --gpu-memory-utilization "${GPU_MEM_UTIL}" \
   --limit-mm-per-prompt '{"image": 0, "video": 0}' \
   --enable-auto-tool-choice \
+  --enable-prefix-caching \
   --tool-call-parser "${TOOL_CALL_PARSER}" \
   --reasoning-parser "${REASONING_PARSER}" \
   --default-chat-template-kwargs "{\"enable_thinking\": ${ENABLE_THINKING}}" \
