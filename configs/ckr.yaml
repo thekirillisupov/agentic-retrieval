@@ -63,6 +63,15 @@ agent:
   use_id_map: true
   # Must match the training config's agent_loop.retrieval_react.tool_budget_feedback.
   tool_budget_feedback: true
+  # Tool-response budgets — must match the training config's
+  # rollout.multi_turn.max_tool_response_length / tool_response_truncate_side
+  # (configs/gspo_qwen3_moe.yaml: 10240 / left), or eval shows the model
+  # contexts it was never trained on.
+  max_tool_response_length: 10240
+  tool_response_truncate_side: left
+  # Per-passage token cap (training used 512 via agent_loop.retrieval_react.
+  # max_passage_tokens). Enabling requires model.tokenizer_path; 0 disables.
+  max_passage_tokens: 0
 
 eval:
   processed_dir: ./data/processed/ckr/

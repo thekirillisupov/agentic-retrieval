@@ -30,6 +30,7 @@ import yaml
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from agent.episode import tool_budget_kwargs_from_cfg
 from agent.harness import AgentHarness, ToolServerClient
 from agent.model_client import build_model_client
 from agent.prompts import PROFILES
@@ -124,6 +125,11 @@ def create_app(config_path: str | None = None) -> FastAPI:
     # OpenAI/vLLM client or an http backend (raw endpoint behind mTLS).
     model_client = build_model_client(model_cfg)
 
+    # Tool-response budgets (must match the training run; see agent/episode.py).
+    # Resolved once at startup — may load an HF tokenizer when
+    # agent.max_passage_tokens > 0.
+    budget_kwargs = tool_budget_kwargs_from_cfg(agent_cfg, model_cfg)
+
     def _make_tool_client() -> ToolServerClient:
         return ToolServerClient(
             search_cfg["url"],
@@ -169,6 +175,7 @@ def create_app(config_path: str | None = None) -> FastAPI:
             top_k_max=int(agent_cfg.get("top_k_max", 50)),
             use_id_map=bool(agent_cfg.get("use_id_map", False)),
             tool_budget_feedback=bool(agent_cfg.get("tool_budget_feedback", False)),
+            **budget_kwargs,
         )
 
         agent_input = AgentInput(

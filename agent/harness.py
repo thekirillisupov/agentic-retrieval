@@ -1,4 +1,11 @@
-"""ReAct loop. Talks to vLLM (OpenAI-compatible) and the tool server (FastAPI)."""
+"""ReAct loop. Talks to vLLM (OpenAI-compatible) and the tool server (FastAPI).
+
+Episode semantics (seen/citability, id_map serialization, tool-response
+budgets, tool-call budget feedback) live in agent/episode.py, shared with the
+training rollout (grpo/agent_loop.py); this file owns only the transport: the
+OpenAI-shaped model client, the tool-server HTTP client, and trajectory
+logging.
+"""
 
 from __future__ import annotations
 
@@ -11,16 +18,18 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
-from openai import OpenAI
 
+from agent.episode import (
+    KNOWN_TOOL_NAMES,
+    SEARCH_TOOL_NAMES,
+    Episode,
+    EpisodeConfig,
+)
 from agent.parser import parse_answer
 from agent.prompts import (
     format_user_content,
     get_prompt,
     get_tool_schemas,
-    render_grep_results,
-    render_neighbours_results,
-    render_search_results_json,
 )
 from agent.schemas import (
     AgentInput,
@@ -31,7 +40,6 @@ from agent.schemas import (
     StoppedReason,
     ToolCallTrace,
     Trajectory,
-    assign_serial_id,
 )
 
 log = logging.getLogger(__name__)
@@ -226,6 +234,11 @@ class AgentHarness:
         use_id_map: bool = False,
         tool_budget_feedback: bool = False,
         model_client: Any | None = None,
+        allow_model_source: bool = False,
+        max_tool_response_length: int = 0,
+        tool_response_truncate_side: str = "left",
+        max_passage_tokens: int = 0,
+        tokenizer: Any = None,
     ) -> None:
         self.model = model
         # A prebuilt client (e.g. an http backend behind mTLS) wins; otherwise
@@ -234,6 +247,10 @@ class AgentHarness:
         if model_client is not None:
             self.client = model_client
         else:
+            # Imported lazily so environments that always inject model_client
+            # (training image, tests) don't need the openai package.
+            from openai import OpenAI
+
             self.client = OpenAI(base_url=vllm_url, api_key=api_key)
         self.tool_client = tool_client
         self.prompt_version = prompt_version
@@ -242,12 +259,19 @@ class AgentHarness:
         self.top_k_default = top_k_default
         self.top_k_max = top_k_max
         self.use_id_map = use_id_map
-        # Mirror of the training agent_loop knob (configs.agent_loop.retrieval_react
-        # .tool_budget_feedback). When True, suffix each tool response with
-        # `[calls used: N/max_tool_calls]` and, once the budget is spent, grant one
-        # final turn for the model to answer instead of stopping immediately. Must
-        # match training so eval trajectories match what the policy was trained on.
+        # These knobs mirror the training agent_loop config
+        # (agent_loop.retrieval_react.* and rollout.multi_turn.*) and MUST match
+        # the run that produced the weights: the policy only ever saw episodes
+        # shaped by them. The episode semantics themselves live in
+        # agent/episode.py, shared with grpo/agent_loop.py.
         self.tool_budget_feedback = tool_budget_feedback
+        self.allow_model_source = allow_model_source
+        self.max_tool_response_length = max_tool_response_length
+        self.tool_response_truncate_side = tool_response_truncate_side
+        self.max_passage_tokens = max_passage_tokens
+        # Needed only when max_passage_tokens > 0 (the harness talks to the
+        # model over an API, so the tokenizer must be supplied explicitly).
+        self.tokenizer = tokenizer
 
     def run(
         self,
@@ -259,14 +283,23 @@ class AgentHarness:
         pv = prompt_version or self.prompt_version
         system_prompt = get_prompt(pv)
 
-        # Serialization: when enabled, doc_ids are replaced with small integers
-        # throughout the episode. This is a harness-level switch (config-driven),
-        # independent of the prompt version.
-        _use_id_map = self.use_id_map
-        # id_map_inv[i] == real doc_id for serial int i; id_map is the reverse.
-        # Populated lazily by assign_serial_id; only consulted when _use_id_map is True.
-        id_map: dict[str, int] = {}
-        id_map_inv: list[str] = []
+        # All episode semantics (seen/citability, id_map serialization,
+        # response budgets, tool-call budget feedback) live in the shared
+        # Episode — the same code the training rollout runs.
+        episode = Episode(
+            EpisodeConfig(
+                max_tool_calls=agent_input.max_tool_calls,
+                top_k_default=agent_input.top_k_default,
+                top_k_max=self.top_k_max,
+                tool_budget_feedback=self.tool_budget_feedback,
+                use_id_map=self.use_id_map,
+                allow_model_source=self.allow_model_source,
+                max_tool_response_length=self.max_tool_response_length,
+                tool_response_truncate_side=self.tool_response_truncate_side,
+                max_passage_tokens=self.max_passage_tokens,
+            ),
+            tokenizer=self.tokenizer,
+        )
 
         # The harness owns the system message; caller passes only the conversation.
         # Apply prompt-version-specific user content formatting (e.g. <client> wrap).
@@ -284,27 +317,19 @@ class AgentHarness:
             else:
                 messages.append(msg)
 
-        seen: dict[str, SeenPassage] = {}
         tool_call_traces: list[ToolCallTrace] = []
         prompt_tokens = 0
         completion_tokens = 0
 
         stopped_reason: StoppedReason = "max_turns"
         ranked_doc_ids: list[str] = []
-        num_tool_calls = 0
-        # tool_budget_feedback diagnostic: tool calls emitted after the budget was
-        # spent (each gets a stub nudge). Mirrors agent_loop's counter.
-        num_over_budget_calls = 0
         turn = 0
-        # tool_budget_feedback: grant the post-budget "final answer" turn exactly
-        # once so a model that keeps calling tools can't spin (mirrors agent_loop).
-        final_answer_chance_used = False
 
         for turn in range(1, agent_input.max_turns + 1):
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[m.to_openai() for m in messages],
-                tools=get_tool_schemas(pv, use_id_map=_use_id_map),
+                tools=get_tool_schemas(pv, use_id_map=self.use_id_map),
                 tool_choice="auto",
                 max_tokens=self.max_tokens,
                 temperature=self.temperature,
@@ -342,62 +367,34 @@ class AgentHarness:
             if assistant_msg.tool_calls:
                 budget_exhausted = False
                 for tc in assistant_msg.tool_calls:
-                    if num_tool_calls >= agent_input.max_tool_calls:
+                    if episode.budget_spent:
                         budget_exhausted = True
                         if not self.tool_budget_feedback:
                             break
-                        num_over_budget_calls += 1
-                        # Feedback mode: answer over-budget calls with an explicit
-                        # stub that nudges the model to stop calling tools and emit
-                        # its <answer> on the next turn (mirrors agent_loop).
                         messages.append(
                             Message(
                                 role="tool",
                                 tool_call_id=tc.id,
-                                content=json.dumps(
-                                    {
-                                        "error": "tool_budget_exhausted",
-                                        "instruction": (
-                                            "You have used all tool calls. Do not "
-                                            "call any more tools. Return your final "
-                                            "<answer> now."
-                                        ),
-                                    }
-                                )
-                                + f"\n[calls used: {num_tool_calls}/{agent_input.max_tool_calls}]",
+                                content=episode.over_budget_stub(),
                             )
                         )
                         continue
                     tool_msg, trace = self._execute_tool_call(
                         tc,
                         turn,
-                        seen,
-                        agent_input.top_k_default,
+                        episode,
                         agent_input.source,
-                        id_map=id_map if _use_id_map else None,
-                        id_map_inv=id_map_inv if _use_id_map else None,
                         search_params=agent_input.search_params,
                     )
-                    num_tool_calls += 1
-                    if self.tool_budget_feedback:
-                        tool_msg.content = (
-                            f"{tool_msg.content}\n[calls used: "
-                            f"{num_tool_calls}/{agent_input.max_tool_calls}]"
-                        )
+                    tool_msg.content = episode.register_tool_call(
+                        tool_msg.content or ""
+                    )
                     messages.append(tool_msg)
                     tool_call_traces.append(trace)
 
-                # One-shot "final answer" turn once the budget is spent: the
-                # over-budget stubs already tell the model it is out of tool
-                # calls, so the loop just continues into one more assistant turn.
-                grant_final_answer = (
+                grant_final_answer = episode.grant_final_answer_turn(
                     budget_exhausted
-                    and self.tool_budget_feedback
-                    and not final_answer_chance_used
                 )
-                if grant_final_answer:
-                    final_answer_chance_used = True
-
                 if budget_exhausted and not grant_final_answer:
                     stopped_reason = "max_tool_calls"
                     break
@@ -409,37 +406,11 @@ class AgentHarness:
                 stopped_reason = "parse_error"
                 break
 
-            # Drop hallucinated ids that the agent never actually retrieved.
-            # Deduplicate by first occurrence so the model cannot game NDCG/recall
-            # by repeating the same doc_id multiple times.
-            valid: list[str] = []
-            seen_in_answer: set[str] = set()
-            for token in answer:
-                if _use_id_map:
-                    # Model emits integer ids; translate back to real doc_ids.
-                    try:
-                        idx = int(token)
-                        doc_id = id_map_inv[idx] if 0 <= idx < len(id_map_inv) else None
-                    except (ValueError, IndexError):
-                        doc_id = None
-                    if doc_id is None:
-                        log.warning("Unknown serial id in answer, dropping: %s", token)
-                        continue
-                else:
-                    doc_id = token
-
-                if doc_id not in seen:
-                    log.warning("Hallucinated doc_id in answer, dropping: %s", doc_id)
-                elif doc_id in seen_in_answer:
-                    log.warning("Duplicate doc_id in answer, dropping: %s", doc_id)
-                else:
-                    valid.append(doc_id)
-                    seen_in_answer.add(doc_id)
-            ranked_doc_ids = valid
+            ranked_doc_ids = episode.validate_answer(answer)
             stopped_reason = "answer"
             break
 
-        ranked_passages = self._build_ranked_passages(ranked_doc_ids, seen)
+        ranked_passages = self._build_ranked_passages(ranked_doc_ids, episode.seen)
 
         trajectory = Trajectory(
             trajectory_id=str(uuid.uuid4()),
@@ -454,8 +425,8 @@ class AgentHarness:
             ranked_doc_ids=ranked_doc_ids,
             stopped_reason=stopped_reason,
             num_turns=turn,
-            num_tool_calls=num_tool_calls,
-            num_over_budget_calls=num_over_budget_calls,
+            num_tool_calls=episode.num_tool_calls,
+            num_over_budget_calls=episode.num_over_budget_calls,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
@@ -473,229 +444,102 @@ class AgentHarness:
         self,
         tc: Any,
         turn: int,
-        seen: dict[str, SeenPassage],
-        top_k_default: int,
+        episode: Episode,
         pinned_source: str | None = None,
-        id_map: dict[str, int] | None = None,
-        id_map_inv: list[str] | None = None,
         search_params: dict[str, Any] | None = None,
     ) -> tuple[Message, ToolCallTrace]:
+        """Transport half of one tool call: parse args, hit the tool server,
+        and feed the raw response into the shared Episode pipeline."""
         name = tc.function.name
         try:
             args = json.loads(tc.function.arguments) if tc.function.arguments else {}
         except json.JSONDecodeError:
             args = {}
 
-        # A `source` emitted by the model overrides the per-row pinned source.
-        source = str(args.get("source") or "").strip() or pinned_source
-
-        _SEARCH_NAMES = {"local_search", "search"}
-
-        if name not in _SEARCH_NAMES and name not in ("grep", "get_neighbours"):
-            content = json.dumps({"error": f"unknown tool: {name}"})
+        if name not in KNOWN_TOOL_NAMES:
+            content, summary = episode.unknown_tool_response(name)
             return (
                 Message(role="tool", tool_call_id=tc.id, content=content),
                 ToolCallTrace(
                     turn=turn,
                     tool=name,
                     arguments=args,
-                    result_summary={"error": "unknown_tool"},
+                    result_summary=summary,
                     latency_ms=0,
                 ),
             )
 
+        source = episode.resolve_source(args, pinned_source)
         t0 = time.perf_counter()
 
-        if name in _SEARCH_NAMES:
+        def _error(e: Exception) -> tuple[Message, ToolCallTrace]:
+            latency_ms = int((time.perf_counter() - t0) * 1000)
+            log.exception("tool server error (%s)", name)
+            content, summary = episode.tool_error_response(e)
+            return (
+                Message(role="tool", tool_call_id=tc.id, content=content),
+                ToolCallTrace(
+                    turn=turn,
+                    tool=name,
+                    arguments=args,
+                    result_summary=summary,
+                    latency_ms=latency_ms,
+                ),
+            )
+
+        if name in SEARCH_TOOL_NAMES:
             query = str(args.get("query", "")).strip()
-            top_k = int(args.get("top_k", top_k_default))
-            top_k = max(1, min(top_k, self.top_k_max))
-            # Over-fetch so that after deduplication we still return ~top_k new docs.
-            fetch_k = min(top_k + len(seen), self.top_k_max)
+            top_k = episode.parse_top_k(args)
             try:
                 response = self.tool_client.local_search(
-                    query=query, top_k=fetch_k, source=source,
+                    query=query,
+                    top_k=episode.search_fetch_k(top_k),
+                    source=source,
                     extra_params=search_params,
                 )
             except Exception as e:
-                latency_ms = int((time.perf_counter() - t0) * 1000)
-                log.exception("tool server error")
-                err_content = json.dumps({"error": str(e), "results": []})
-                return (
-                    Message(role="tool", tool_call_id=tc.id, content=err_content),
-                    ToolCallTrace(
-                        turn=turn,
-                        tool=name,
-                        arguments=args,
-                        result_summary={"error": str(e)},
-                        latency_ms=latency_ms,
-                    ),
-                )
+                return _error(e)
             latency_ms = int((time.perf_counter() - t0) * 1000)
-            results: list[dict[str, Any]] = response.get("results", [])
-            # Render the ranked hits in order, preserving the position of every
-            # passage but optimising context: NEW docs are shown as full
-            # passages, already-seen docs as id-only placeholders
-            # ({"doc_id": ..., "seen": true}). We over-fetched above; walk in
-            # rank order until top_k NEW docs have been shown, then stop (any
-            # trailing seen ids below the last new doc are dropped). Already-seen
-            # docs still get their score metadata refreshed.
-            display: list[dict[str, Any]] = []
-            new_doc_ids: list[str] = []
-            for r in results:
-                doc_id = r["doc_id"]
-                score = float(r["score"])
-                if doc_id in seen:
-                    seen[doc_id].update(score)
-                    stub: dict[str, Any] = {"doc_id": doc_id}
-                    if id_map is not None and id_map_inv is not None:
-                        stub["doc_id"] = assign_serial_id(doc_id, id_map, id_map_inv)
-                    display.append(stub)
-                else:
-                    seen[doc_id] = SeenPassage(
-                        doc_id=doc_id,
-                        title=r["title"],
-                        text=r["text"],
-                        best_score=score,
-                        first_seen_turn=turn,
-                    )
-                    if id_map is not None and id_map_inv is not None:
-                        serial = assign_serial_id(doc_id, id_map, id_map_inv)
-                        display.append({**r, "doc_id": serial})
-                    else:
-                        display.append(r)
-                    new_doc_ids.append(doc_id)
-                    if len(new_doc_ids) >= top_k:
-                        break
-            rendered = render_search_results_json(display)
-            summary: dict[str, Any] = {
-                "num_results": len(display),
-                "num_new": len(new_doc_ids),
-                "num_seen_refs": len(display) - len(new_doc_ids),
-                "top_doc_ids": new_doc_ids,
-            }
+            rendered, summary = episode.process_search_results(
+                response.get("results", []), top_k, turn
+            )
 
         elif name == "grep":
             pattern = str(args.get("pattern", "")).strip()
-            top_k = int(args.get("top_k", top_k_default))
-            top_k = max(1, min(top_k, self.top_k_max))
+            top_k = episode.parse_top_k(args)
             try:
                 response = self.tool_client.grep(
                     pattern=pattern, top_k=top_k, source=source,
                     extra_params=search_params,
                 )
             except Exception as e:
-                latency_ms = int((time.perf_counter() - t0) * 1000)
-                log.exception("tool server error (grep)")
-                err_content = json.dumps({"error": str(e), "results": []})
-                return (
-                    Message(role="tool", tool_call_id=tc.id, content=err_content),
-                    ToolCallTrace(
-                        turn=turn,
-                        tool=name,
-                        arguments=args,
-                        result_summary={"error": str(e)},
-                        latency_ms=latency_ms,
-                    ),
-                )
+                return _error(e)
             latency_ms = int((time.perf_counter() - t0) * 1000)
             results = response.get("results", [])
-            total_matches: int = response.get("total_matches", len(results))
-            # Grep hits have no score; use 1.0 as a sentinel for exact matches.
-            for r in results:
-                doc_id = r["doc_id"]
-                if doc_id not in seen:
-                    seen[doc_id] = SeenPassage(
-                        doc_id=doc_id,
-                        title=r["title"],
-                        text=r["text"],
-                        best_score=1.0,
-                        first_seen_turn=turn,
-                    )
-            if id_map is not None and id_map_inv is not None:
-                results_display = [
-                    {**r, "doc_id": assign_serial_id(r["doc_id"], id_map, id_map_inv)}
-                    for r in results
-                ]
-            else:
-                results_display = results
-            rendered = render_grep_results(results_display, total_matches)
-            summary = {
-                "num_results": len(results),
-                "total_matches": total_matches,
-                "top_doc_ids": [r["doc_id"] for r in results],
-            }
+            rendered, summary = episode.process_grep_results(
+                results, response.get("total_matches", len(results)), turn
+            )
 
         else:  # get_neighbours
-            doc_id_arg_raw = str(args.get("doc_id", "")).strip()
-            window = int(args.get("window", 1))
-            window = max(1, min(window, 10))
-
-            # When id_map is active the model passes a serial integer; decode to
-            # the real doc_id before hitting the tool server.
-            if id_map is not None and id_map_inv is not None:
-                try:
-                    idx = int(doc_id_arg_raw)
-                    doc_id_arg = (
-                        id_map_inv[idx] if 0 <= idx < len(id_map_inv) else doc_id_arg_raw
-                    )
-                except ValueError:
-                    doc_id_arg = doc_id_arg_raw
-                # Keep the original int string for error messages shown to the model.
-                anchor_display: Any = doc_id_arg_raw
-            else:
-                doc_id_arg = doc_id_arg_raw
-                anchor_display = doc_id_arg_raw
-
+            doc_id_arg, anchor_display = episode.decode_doc_id_arg(
+                str(args.get("doc_id", "")).strip()
+            )
+            window = episode.parse_window(args)
             try:
                 response = self.tool_client.get_neighbours(
                     doc_id=doc_id_arg, window=window, source=source,
                     extra_params=search_params,
                 )
             except Exception as e:
-                latency_ms = int((time.perf_counter() - t0) * 1000)
-                log.exception("tool server error (get_neighbours)")
-                err_content = json.dumps({"error": str(e), "results": []})
-                return (
-                    Message(role="tool", tool_call_id=tc.id, content=err_content),
-                    ToolCallTrace(
-                        turn=turn,
-                        tool=name,
-                        arguments=args,
-                        result_summary={"error": str(e)},
-                        latency_ms=latency_ms,
-                    ),
-                )
+                return _error(e)
             latency_ms = int((time.perf_counter() - t0) * 1000)
-            results = response.get("results", [])
-            status = str(response.get("status", "ok"))
-            # Neighbours are structural (no relevance score). Register so the
-            # model may cite them; use 0.0 since there is no semantic score.
-            for r in results:
-                doc_id = r["doc_id"]
-                if doc_id not in seen:
-                    seen[doc_id] = SeenPassage(
-                        doc_id=doc_id,
-                        title=r["title"],
-                        text=r["text"],
-                        best_score=0.0,
-                        first_seen_turn=turn,
-                    )
-            if id_map is not None and id_map_inv is not None:
-                results_for_render = [
-                    {**r, "doc_id": assign_serial_id(r["doc_id"], id_map, id_map_inv)}
-                    for r in results
-                ]
-            else:
-                results_for_render = results
-            rendered = render_neighbours_results(
-                results_for_render, status, anchor_display, window
+            rendered, summary = episode.process_neighbours_results(
+                response.get("results", []),
+                str(response.get("status", "ok")),
+                anchor_display,
+                window,
+                turn,
             )
-            summary = {
-                "num_results": len(results),
-                "status": status,
-                "top_doc_ids": [r["doc_id"] for r in results],
-            }
 
         tool_msg = Message(role="tool", tool_call_id=tc.id, content=rendered)
         trace = ToolCallTrace(

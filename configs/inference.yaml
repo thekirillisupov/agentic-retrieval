@@ -18,6 +18,10 @@ model:
   api_key: EMPTY
   max_tokens: 4096
   temperature: 0.6
+  # HF name or local dir of the model's tokenizer. Only needed when
+  # agent.max_passage_tokens > 0 (the harness talks to the model over an API
+  # and has no tokenizer of its own).
+  # tokenizer_path: /models/agentic-retrieval
   # Mutual TLS also applies to the openai backend (OpenAI API behind mTLS):
   # tls:
   #   cert_file: published.pem
@@ -84,6 +88,18 @@ agent:
   top_k_max: 50
   use_id_map: true
   tool_budget_feedback: true
+  # Tool-response budgets. MUST match the training run — the policy only ever
+  # saw tool responses fitted to these budgets, so serving without them shows
+  # the model contexts it was never trained on. Mirror the training config's
+  # rollout.multi_turn.max_tool_response_length / tool_response_truncate_side
+  # (configs/gspo_qwen3_moe.yaml: 10240 / left).
+  max_tool_response_length: 10240
+  tool_response_truncate_side: left
+  # Per-passage token cap, applied to each hit's text BEFORE the total-response
+  # char budget (training config's agent_loop.retrieval_react.max_passage_tokens;
+  # gspo_qwen3_moe.yaml used 512). Enabling it requires model.tokenizer_path
+  # (HF name or local dir) so the harness can tokenize passages; 0 disables.
+  max_passage_tokens: 0
 
 service:
   host: 0.0.0.0

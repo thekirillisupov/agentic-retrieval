@@ -64,6 +64,14 @@ agent:
   use_id_map: false
   # Must match the training config's agent_loop.retrieval_react.tool_budget_feedback.
   tool_budget_feedback: false
+  # Tool-response budgets — must match the training run's
+  # rollout.multi_turn.max_tool_response_length / tool_response_truncate_side
+  # and agent_loop.retrieval_react.max_passage_tokens, or eval shows the model
+  # contexts it was never trained on. 0 = unlimited (legacy behaviour);
+  # max_passage_tokens > 0 also requires model.tokenizer_path.
+  max_tool_response_length: 0
+  tool_response_truncate_side: left
+  max_passage_tokens: 0
 
 eval:
   processed_dir: ./data/processed/ckr_per_doc_filtered/
