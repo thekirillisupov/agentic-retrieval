@@ -14,6 +14,7 @@ from pathlib import Path
 import yaml
 from tqdm import tqdm
 
+from agent.episode import tool_budget_kwargs_from_cfg
 from agent.harness import AgentHarness, ToolServerClient
 from agent.prompts import format_user_content, profile_for_source
 from agent.schemas import AgentInput, Message
@@ -54,6 +55,8 @@ def run_agent_eval(
         top_k_max=cfg["index"].get("top_k_max", 50),
         use_id_map=cfg["agent"].get("use_id_map", False),
         tool_budget_feedback=cfg["agent"].get("tool_budget_feedback", False),
+        # Tool-response budgets (must match the training run; see agent/episode.py).
+        **tool_budget_kwargs_from_cfg(cfg["agent"], cfg["model"]),
     )
 
     out_dir = Path(cfg["trajectories"]["output_dir"])
