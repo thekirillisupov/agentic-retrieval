@@ -12,34 +12,45 @@ tool_server:
   port: 8100
 
 embedder:
-  name: BAAI/bge-m3
-  dim: 1024
+  name: Qwen/Qwen3-Embedding-4B
+  dim: 2560
   device: cuda:0
   batch_size: 32
   max_length: 8192
-  query_prefix: ""
+  pooling: "last"
+  add_eos: true
+  padding_side: "left"
+  dtype: "float16"
+  device_map: "auto"
+  query_prefix: "Instruct: Given a search query, retrieve relevant passages that answer the query\nQuery:"
   passage_prefix: ""
-  pooling: "cls"
 
 index:
-  dir: ./indexes/sbol/
-  top_k_default: 8
+  top_k_default: 3
   top_k_max: 50
   use_gpu: false
-  gpu_id: 3
   cache_size: 10000
   default_source: sbol
+  sources:
+    musique:
+      dir: ./indexes/qwen3/musique/
+    sbol:
+      dir: ./indexes/qwen3/sbol/
+    rnd:
+      dir: ./indexes/qwen3/rnd_index/
+    ckr:
+      dir: ./indexes/qwen3/ckr_index/
 
 agent:
   max_turns: 8
-  max_tool_calls: 10
+  max_tool_calls: 3
   prompt_version: v2_search_only
   # Replace doc_ids with small per-episode integers (0,1,2… by first
   # appearance) in tool output; the model answers with ints and the harness
   # maps them back to doc_ids for NDCG. Independent of prompt_version.
-  use_id_map: false
+  use_id_map: true
   # Must match the training config's agent_loop.retrieval_react.tool_budget_feedback.
-  tool_budget_feedback: false
+  tool_budget_feedback: true
   # Tool-response budgets — must match the training run's
   # rollout.multi_turn.max_tool_response_length / tool_response_truncate_side
   # and agent_loop.retrieval_react.max_passage_tokens, or eval shows the model

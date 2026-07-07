@@ -17,6 +17,8 @@ class MetricResult:
     precision: float
     recall: float
     f1: float
+    recall_at_3: float = 0.0
+    recall_at_5: float = 0.0
 
 
 def _dedup_ranked(predicted: list[str]) -> list[str]:
@@ -44,6 +46,13 @@ def simple_recall(predicted: list[str], gold: set[str]) -> float:
         return 0.0
     hits = sum(1 for p in predicted if p in gold)
     return hits / len(gold)
+
+
+def recall_at_k(predicted: list[str], gold: set[str], k: int) -> float:
+    if not gold:
+        return 0.0
+    top = set(_dedup_ranked(predicted)[:k])
+    return sum(1 for g in gold if g in top) / len(gold)
 
 
 def simple_f1(precision: float, recall: float) -> float:
@@ -95,6 +104,8 @@ def evaluate_one(predicted: list[str], gold: set[str], k: int = 10) -> MetricRes
         precision=p,
         recall=r,
         f1=simple_f1(p, r),
+        recall_at_3=recall_at_k(predicted, gold, 3),
+        recall_at_5=recall_at_k(predicted, gold, 5),
     )
 
 
@@ -107,4 +118,6 @@ def aggregate(results: list[MetricResult]) -> MetricResult:
         precision=sum(r.precision for r in results) / n,
         recall=sum(r.recall for r in results) / n,
         f1=sum(r.f1 for r in results) / n,
+        recall_at_3=sum(r.recall_at_3 for r in results) / n,
+        recall_at_5=sum(r.recall_at_5 for r in results) / n,
     )
