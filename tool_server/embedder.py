@@ -5,9 +5,14 @@ the embedder is the only place that knows about prefixes and pooling. This means
 the indexing pipeline and the tool server can never accidentally mix conventions.
 
 Supported pooling modes:
-  "mean" — weighted average pool over non-padding tokens (E5-family)
-  "cls"  — first [CLS] token (BGE-M3 and most BGE models)
-  "last" — last non-padding token (decoder embedders, e.g. Qwen3-Embedding)
+  "mean"             — weighted average pool over non-padding tokens (E5-family)
+  "cls"              — first [CLS] token (BGE-M3 and most BGE models)
+  "last"             — last non-padding token (decoder embedders, e.g. Qwen3-Embedding)
+  "latent_attention" — model does its own pooling internally (e.g.
+                        ai-sage/Giga-Embeddings-instruct's latent-attention head);
+                        we call forward(..., return_embeddings=True) and use the
+                        returned tensor as-is instead of touching hidden states.
+                        Requires trust_remote_code=True.
 
 L2-normalization is enforced here too, so the index can use IndexFlatIP and get
 cosine similarity for free.
@@ -20,11 +25,14 @@ from typing import Iterable, Literal
 
 import numpy as np
 import torch
+import transformers
 from transformers import AutoModel, AutoTokenizer
 
 log = logging.getLogger(__name__)
 
-PoolingMode = Literal["mean", "cls", "last"]
+_TRANSFORMERS_MAJOR = int(transformers.__version__.split(".")[0])
+
+PoolingMode = Literal["mean", "cls", "last", "latent_attention"]
 
 _DTYPES: dict[str, torch.dtype] = {
     "float32": torch.float32,
@@ -47,6 +55,8 @@ class E5Embedder:
         add_eos: bool = False,
         padding_side: str | None = None,
         device_map: str | dict | None = None,
+        trust_remote_code: bool = False,
+        attn_implementation: str | None = None,
     ) -> None:
         self.name = name
         self.device = device
@@ -81,6 +91,8 @@ class E5Embedder:
             padding_side = "left"
         if padding_side is not None:
             tok_kwargs["padding_side"] = padding_side
+        if trust_remote_code:
+            tok_kwargs["trust_remote_code"] = True
         self.tokenizer = AutoTokenizer.from_pretrained(name, **tok_kwargs)
 
         model_kwargs: dict = {"use_safetensors": True}
@@ -89,7 +101,15 @@ class E5Embedder:
                 raise ValueError(
                     f"unknown dtype {dtype!r}; choose from {list(_DTYPES)}"
                 )
-            model_kwargs["dtype"] = _DTYPES[dtype]
+            # transformers>=5 renamed the from_pretrained kwarg torch_dtype ->
+            # dtype; older transformers (e.g. the pinned env some
+            # trust_remote_code models require) only accepts torch_dtype.
+            dtype_kwarg = "dtype" if _TRANSFORMERS_MAJOR >= 5 else "torch_dtype"
+            model_kwargs[dtype_kwarg] = _DTYPES[dtype]
+        if trust_remote_code:
+            model_kwargs["trust_remote_code"] = True
+        if attn_implementation is not None:
+            model_kwargs["attn_implementation"] = attn_implementation
         if device_map is not None:
             # accelerate dispatches modules across GPUs; do NOT call .to(device)
             # afterwards (it would undo the dispatch). Inputs are placed on the
@@ -162,17 +182,24 @@ class E5Embedder:
                 truncation=True,
                 return_tensors="pt",
             ).to(self._input_device)
-        outputs = self.model(**batch)
-        # With device_map sharding, hidden states emerge on the last shard's
-        # device; align the mask to it so pooling never crosses devices.
-        hidden = outputs.last_hidden_state
-        mask = batch["attention_mask"].to(hidden.device)
-        if self.pooling == "cls":
-            emb = hidden[:, 0, :]
-        elif self.pooling == "last":
-            emb = _last_token_pool(hidden, mask)
+        if self.pooling == "latent_attention":
+            # The model's own forward pass does pooling (e.g. a learned
+            # latent-attention head) and hands back embeddings directly —
+            # there is no last_hidden_state to pool ourselves.
+            emb = self.model(**batch, return_embeddings=True)
         else:
-            emb = _average_pool(hidden, mask)
+            outputs = self.model(**batch)
+            # With device_map sharding, hidden states emerge on the last
+            # shard's device; align the mask to it so pooling never crosses
+            # devices.
+            hidden = outputs.last_hidden_state
+            mask = batch["attention_mask"].to(hidden.device)
+            if self.pooling == "cls":
+                emb = hidden[:, 0, :]
+            elif self.pooling == "last":
+                emb = _last_token_pool(hidden, mask)
+            else:
+                emb = _average_pool(hidden, mask)
         emb = torch.nn.functional.normalize(emb.float(), p=2, dim=1)
         return emb.cpu().numpy().astype(np.float32)
 

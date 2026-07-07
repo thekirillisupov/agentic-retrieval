@@ -76,6 +76,8 @@ def main() -> None:
         add_eos=emb_cfg.get("add_eos", False),
         padding_side=emb_cfg.get("padding_side"),
         device_map=emb_cfg.get("device_map"),
+        trust_remote_code=emb_cfg.get("trust_remote_code", False),
+        attn_implementation=emb_cfg.get("attn_implementation"),
     )
 
     # Truncation sanity check: the spec calls out >1% truncation as a smell.

@@ -17,13 +17,25 @@ from tqdm import tqdm
 from agent.episode import tool_budget_kwargs_from_cfg
 from agent.harness import AgentHarness, ToolServerClient
 from agent.prompts import format_user_content, profile_for_source
-from agent.schemas import AgentInput, Message
+from agent.schemas import AgentInput, Message, Trajectory
 from eval_.baseline import load_eval
 from eval_.metrics import aggregate, evaluate_one
 from trajectories.checker import maybe_check_consistency
 from trajectories.writer import TrajectoryWriter
 
 log = logging.getLogger(__name__)
+
+
+def mean_tool_latency_ms(trajectory: Trajectory) -> float:
+    if not trajectory.tool_calls:
+        return 0.0
+    return sum(tc.latency_ms for tc in trajectory.tool_calls) / len(trajectory.tool_calls)
+
+
+def mean_llm_latency_ms(trajectory: Trajectory) -> float:
+    if not trajectory.llm_latencies_ms:
+        return 0.0
+    return sum(trajectory.llm_latencies_ms) / len(trajectory.llm_latencies_ms)
 
 
 def run_agent_eval(
@@ -67,12 +79,18 @@ def run_agent_eval(
 
     per_example = []
     metrics = []
+    tool_latencies: list[float] = []
+    llm_latencies: list[float] = []
     stop_counts: dict[str, int] = {}
     try:
         for i, row in enumerate(tqdm(eval_rows, desc="agent eval")):
             question = row["question"]
             row_source = row.get("source") or cfg["index"].get("default_source")
-            row_pv = profile_for_source(row_source) if row_source else cfg["agent"].get("prompt_version", "v2")
+            row_pv = (
+                profile_for_source(row_source)
+                if row_source
+                else cfg["agent"].get("prompt_version", "v2")
+            )
             if wrap_client:
                 question = format_user_content(question, row_pv)
             agent_input = AgentInput(
@@ -83,7 +101,9 @@ def run_agent_eval(
                 source=row_source,
             )
             try:
-                result = harness.run(agent_input, gold_doc_ids=row["gold_doc_ids"], prompt_version=row_pv)
+                result = harness.run(
+                    agent_input, gold_doc_ids=row["gold_doc_ids"], prompt_version=row_pv
+                )
             except Exception as e:
                 log.exception("agent run failed for %s", row["question_id"])
                 stop_counts["error"] = stop_counts.get("error", 0) + 1
@@ -107,6 +127,10 @@ def run_agent_eval(
             k = cfg["eval"]["ndcg_k"]
             m = evaluate_one(result.ranked_doc_ids, gold, k=k)
             metrics.append(m)
+            tool_lat = mean_tool_latency_ms(result.trajectory)
+            llm_lat = mean_llm_latency_ms(result.trajectory)
+            tool_latencies.append(tool_lat)
+            llm_latencies.append(llm_lat)
             per_example.append(
                 {
                     "question_id": row["question_id"],
@@ -115,7 +139,11 @@ def run_agent_eval(
                     "ndcg": m.ndcg,
                     "precision": m.precision,
                     "recall": m.recall,
+                    "recall_at_3": m.recall_at_3,
+                    "recall_at_5": m.recall_at_5,
                     "f1": m.f1,
+                    "tool_latency_ms_mean": tool_lat,
+                    "llm_latency_ms_mean": llm_lat,
                     "num_turns": result.trajectory.num_turns,
                     "num_tool_calls": result.trajectory.num_tool_calls,
                     "stopped_reason": result.stopped_reason,
@@ -133,6 +161,8 @@ def run_agent_eval(
         "ndcg": agg.ndcg,
         "precision": agg.precision,
         "recall": agg.recall,
+        "recall_at_3": agg.recall_at_3,
+        "recall_at_5": agg.recall_at_5,
         "f1": agg.f1,
         "stopped_reason_counts": stop_counts,
         "avg_turns": (
@@ -141,6 +171,12 @@ def run_agent_eval(
         "avg_tool_calls": (
             sum(p.get("num_tool_calls", 0) for p in per_example)
             / max(1, len(per_example))
+        ),
+        "tool_latency_ms_mean": (
+            sum(tool_latencies) / len(tool_latencies) if tool_latencies else 0.0
+        ),
+        "llm_latency_ms_mean": (
+            sum(llm_latencies) / len(llm_latencies) if llm_latencies else 0.0
         ),
         "per_example": per_example,
     }
@@ -180,10 +216,16 @@ def main() -> None:
             )
             runs.append({"max_tool_calls": budget, "summary": summary})
             log.info(
-                "budget=%d  ndcg=%.4f  recall=%.4f  avg_calls=%.2f",
+                "budget=%d  ndcg@%d=%.4f  recall@3=%.4f  recall@5=%.4f  recall=%.4f  "
+                "tool_latency_ms_mean=%.1f  llm_latency_ms_mean=%.1f  avg_calls=%.2f",
                 budget,
+                summary["top_k"],
                 summary["ndcg"],
+                summary["recall_at_3"],
+                summary["recall_at_5"],
                 summary["recall"],
+                summary["tool_latency_ms_mean"],
+                summary["llm_latency_ms_mean"],
                 summary["avg_tool_calls"],
             )
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
@@ -195,13 +237,19 @@ def main() -> None:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         Path(args.out).write_text(json.dumps(summary, indent=2, ensure_ascii=False))
         log.info(
-            "agent n=%d  ndcg@%d=%.4f  precision=%.4f  recall=%.4f  f1=%.4f  avg_calls=%.2f",
+            "agent n=%d  ndcg@%d=%.4f  recall@3=%.4f  recall@5=%.4f  "
+            "precision=%.4f  recall=%.4f  f1=%.4f  "
+            "tool_latency_ms_mean=%.1f  llm_latency_ms_mean=%.1f  avg_calls=%.2f",
             summary["n"],
             summary["top_k"],
             summary["ndcg"],
+            summary["recall_at_3"],
+            summary["recall_at_5"],
             summary["precision"],
             summary["recall"],
             summary["f1"],
+            summary["tool_latency_ms_mean"],
+            summary["llm_latency_ms_mean"],
             summary["avg_tool_calls"],
         )
 

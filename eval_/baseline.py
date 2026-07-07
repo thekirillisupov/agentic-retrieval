@@ -43,6 +43,7 @@ def run(
 
     per_example = []
     metrics = []
+    tool_latencies: list[int] = []
     try:
         for row in eval_rows:
             response = tool.local_search(
@@ -54,6 +55,7 @@ def run(
             gold = set(row["gold_doc_ids"])
             m = evaluate_one(predicted, gold, k=top_k)
             metrics.append(m)
+            tool_latencies.append(int(response.get("latency_ms", 0)))
             per_example.append(
                 {
                     "question_id": row["question_id"],
@@ -62,7 +64,10 @@ def run(
                     "ndcg": m.ndcg,
                     "precision": m.precision,
                     "recall": m.recall,
+                    "recall_at_3": m.recall_at_3,
+                    "recall_at_5": m.recall_at_5,
                     "f1": m.f1,
+                    "tool_latency_ms_mean": int(response.get("latency_ms", 0)),
                 }
             )
     finally:
@@ -75,7 +80,12 @@ def run(
         "ndcg": agg.ndcg,
         "precision": agg.precision,
         "recall": agg.recall,
+        "recall_at_3": agg.recall_at_3,
+        "recall_at_5": agg.recall_at_5,
         "f1": agg.f1,
+        "tool_latency_ms_mean": (
+            sum(tool_latencies) / len(tool_latencies) if tool_latencies else 0.0
+        ),
         "per_example": per_example,
     }
 
@@ -108,14 +118,18 @@ def main() -> None:
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(json.dumps(summary, indent=2, ensure_ascii=False))
     log.info(
-        "baseline n=%d top_k=%d  ndcg@%d=%.4f  precision=%.4f  recall=%.4f  f1=%.4f",
+        "baseline n=%d top_k=%d  ndcg@%d=%.4f  recall@3=%.4f  recall@5=%.4f  "
+        "precision=%.4f  recall=%.4f  f1=%.4f  tool_latency_ms_mean=%.1f",
         summary["n"],
         summary["top_k"],
         summary["top_k"],
         summary["ndcg"],
+        summary["recall_at_3"],
+        summary["recall_at_5"],
         summary["precision"],
         summary["recall"],
         summary["f1"],
+        summary["tool_latency_ms_mean"],
     )
 
 
