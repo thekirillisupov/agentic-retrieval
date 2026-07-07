@@ -22,7 +22,9 @@ The default candidate is the quantized build
 ## Pipeline
 
 ```
-[1] prune.collect_stats   forward passes over the STATS slice of grpo_train.parquet,
+[1] prune.collect_stats   forward passes over the STATS slice of the data source
+                          (grpo_train.parquet prompts, or full recorded rollouts
+                          via --trajectories — see "Data sources" below),
                           hooks on every *.mlp.gate router; per layer/expert:
                           top-k selection count + routed probability mass
         │                 (renormalised iff norm_topk_prob, i.e. the weight the
@@ -48,9 +50,10 @@ One command:
 # inference/quant venv (llmcompressor ships compressed-tensors, needed to load W8A8)
 bash scripts/prune_experts.sh                    # COVERAGE=0.99 default
 KEEP=64 bash scripts/prune_experts.sh            # fixed keep per layer
-COVERAGE=0.995 NUM_SAMPLES=1024 bash scripts/prune_experts.sh
+TRAJECTORIES=trajectories_data/gspo_qwen3_moe/65.jsonl \
+MAX_SEQ_LEN=8192 bash scripts/prune_experts.sh   # stats+val on full rollouts
 
-# knobs (env): MODEL TRAIN_PARQUET WORKDIR KEEP|COVERAGE METRIC
+# knobs (env): MODEL TRAIN_PARQUET|TRAJECTORIES WORKDIR KEEP|COVERAGE METRIC
 #              NUM_SAMPLES VAL_SAMPLES MAX_SEQ_LEN SEED PROMPT_VERSION
 ```
 
@@ -58,16 +61,37 @@ Outputs land in `checkpoints/pruned/<candidate>/`:
 `router_stats.json`, `prune_plan.json`, `model/` (the pruned checkpoint,
 with an `expert_pruning.json` provenance stamp), `validation.json`.
 
-## Train parquet as the validation domain
+## Data sources: parquet prompts vs recorded rollouts
 
-Rows are shuffled once with `--seed`; the stats pass reads the head
-(`--num-samples`), validation reads the reserved tail (`--val-samples`).
-`collect_stats` takes `--val-samples` precisely so the reservation is fixed at
-stats time — `validate` must be called with the **same**
-`--num-samples/--val-samples/--seed` or it refuses to make an honest split
-(overlap raises). Prompts are rendered exactly like quantization calibration
-(`quantize/calibration.py`): chat template + per-row `prompt_version` tool
-schemas + `add_generation_prompt`, `enable_thinking=False`.
+No agentic loop runs during stats/validation — both are teacher-forced forward
+passes over recorded tokens. What those tokens cover depends on the source
+(same convention as `quantize.quantize --trajectories`):
+
+| Source | Contents | Tool results seen? |
+|---|---|---|
+| `--train-parquet` (`grpo_train.parquet`) | single-turn `[system, user]` prompts, `add_generation_prompt=True` | **no** — prompt-encoding distribution only |
+| `--trajectories` (`trajectories_data/*.jsonl`, `messages_full`) | complete multi-turn rollouts: system + user + tool calls + **tool results** + final answer, tokenized verbatim | **yes** |
+
+Prefer `--trajectories` for pruning: experts that only fire while the model
+processes search results are invisible to the parquet prompts and would be
+falsely pruned as dead. Raise `MAX_SEQ_LEN` (e.g. 8192) — rollouts are much
+longer than bare prompts:
+
+```bash
+TRAJECTORIES=trajectories_data/gspo_qwen3_moe/65.jsonl \
+MAX_SEQ_LEN=8192 bash scripts/prune_experts.sh
+```
+
+## Held-out validation split
+
+Rows of the chosen source are shuffled once with `--seed`; the stats pass
+reads the head (`--num-samples`), validation reads the reserved tail
+(`--val-samples`). `collect_stats` takes `--val-samples` precisely so the
+reservation is fixed at stats time — `validate` must be called with the
+**same source** and the same `--num-samples/--val-samples/--seed` or it
+refuses to make an honest split (overlap raises). Prompts are rendered exactly
+like quantization calibration (`quantize/calibration.py`): chat template +
+per-row `prompt_version` tool schemas, `enable_thinking=False`.
 
 ## Comparing several candidates
 
@@ -107,12 +131,15 @@ index-agnostic.
 - **Uniform keep only.** HF/vLLM configs carry one `num_experts`; a layer that
   needs more experts than others drags the whole model up via `--coverage`.
 - **Dead-slot warning.** `prune.select` warns when kept slots never fired
-  during the stats pass — raise `--num-samples` (or use trajectory-style
-  multi-turn stats data) before trusting the plan.
-- **Domain lock-in.** Importance is measured on the train parquet only; experts
-  that serve out-of-domain traffic will be pruned. That is the point of using
-  the train distribution as the validation domain — but don't ship the pruned
-  build to traffic that looks nothing like it.
+  during the stats pass — raise `--num-samples` and switch to `--trajectories`
+  before trusting the plan.
+- **Single-turn stats undercount reasoning experts.** With `--train-parquet`
+  the router never sees tool-result tokens (no agentic loop runs); use
+  `--trajectories` so multi-turn experts are represented.
+- **Domain lock-in.** Importance is measured on the training distribution only;
+  experts that serve out-of-domain traffic will be pruned. That is the point of
+  using the train distribution as the validation domain — but don't ship the
+  pruned build to traffic that looks nothing like it.
 - **Prune-then-quantize vs quantize-then-prune.** This pipeline prunes the
   already-quantized candidate (no requantization needed, GPTQ calibration
   stays valid because surviving expert weights are untouched). If you instead

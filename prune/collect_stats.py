@@ -1,4 +1,4 @@
-"""Stage 1: collect per-layer expert routing statistics on the train parquet.
+"""Stage 1: collect per-layer expert routing statistics on the validation domain.
 
 Hooks every MoE router (``*.mlp.gate`` Linear — bf16 even in the W8A8 build,
 it is on the quantization ignore list) and accumulates, per layer and expert:
@@ -11,14 +11,26 @@ it is on the quantization ignore list) and accumulates, per layer and expert:
 The candidate model IS the model being profiled — routing is measured on the
 exact checkpoint that will be pruned (the W8A8 candidate), not on a bf16 proxy.
 
+Two data sources (same convention as quantize/quantize.py):
+
+  --train-parquet   grpo_train.parquet ``prompt`` column: single-turn
+                    [system, user] prompts. NO agentic loop runs and no tool
+                    results are seen — this covers the prompt-encoding
+                    distribution only.
+  --trajectories    trajectory JSONL (``messages_full``): recorded multi-turn
+                    rollouts including tool calls AND tool results. Preferred
+                    for pruning: it routes tokens through the experts that only
+                    fire while the model processes search results, which the
+                    parquet prompts never activate.
+
 Run (same env as quantize/ — needs llmcompressor's compressed-tensors for the
 W8A8 candidate):
 
   python -m prune.collect_stats \
     --model checkpoints/quantized/qwen3_5_35b_a3b_w8a8 \
-    --train-parquet data/processed/unioned/grpo_train.parquet \
+    --trajectories trajectories_data/gspo_qwen3_moe/65.jsonl \
     --output checkpoints/pruned/qwen3_5_35b_a3b_w8a8/router_stats.json \
-    --num-samples 512 --val-samples 128 --max-seq-len 4096
+    --num-samples 512 --val-samples 128 --max-seq-len 8192
 """
 
 from __future__ import annotations
@@ -34,22 +46,33 @@ _LAYER_RE = re.compile(r"\.layers\.(\d+)\.mlp\.gate$")
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", required=True, help="HF checkpoint dir (the candidate).")
-    ap.add_argument(
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument(
         "--train-parquet",
-        required=True,
-        help="grpo_train.parquet — the validation domain of the pipeline.",
+        help="grpo_train.parquet — single-turn prompts (no tool results seen).",
+    )
+    src.add_argument(
+        "--trajectories",
+        help="Trajectory JSONL with full multi-turn rollouts (messages_full), "
+        "e.g. trajectories_data/gspo_qwen3_moe/65.jsonl. Includes tool results "
+        "— the higher-fidelity source for expert pruning.",
     )
     ap.add_argument("--output", required=True, help="Where to write router_stats.json.")
     ap.add_argument("--num-samples", type=int, default=512,
-                    help="Rows used for the stats pass (front of the shuffled parquet).")
+                    help="Rows used for the stats pass (front of the shuffled pool).")
     ap.add_argument("--val-samples", type=int, default=128,
                     help="Rows RESERVED for prune.validate (tail of the shuffled "
-                    "parquet). Reserved here so the two stages cannot overlap.")
-    ap.add_argument("--max-seq-len", type=int, default=4096)
+                    "pool). Reserved here so the two stages cannot overlap.")
+    ap.add_argument("--max-seq-len", type=int, default=4096,
+                    help="Truncation length; raise (e.g. 8192) for --trajectories, "
+                    "multi-turn rollouts are much longer than bare prompts.")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--prompt-field", default="prompt")
+    ap.add_argument("--prompt-field", default="prompt",
+                    help="Parquet column with message arrays (--train-parquet only).")
+    ap.add_argument("--messages-field", default="messages_full",
+                    help="JSONL key with the full rollout (--trajectories only).")
     ap.add_argument("--prompt-version", default="v2_search_only",
-                    help="Fallback when a row's extra_info has no prompt_version.")
+                    help="Fallback when a row carries no prompt_version.")
     ap.add_argument("--dtype", default="bfloat16")
     ap.add_argument("--device-map", default="auto")
     args = ap.parse_args()
@@ -110,8 +133,9 @@ def main() -> None:
     print(f"[stats] hooked {len(handles)} router layers")
 
     # --- forward pass over the stats slice --------------------------------
+    source = args.train_parquet or args.trajectories
     ds = load_split(
-        args.train_parquet,
+        source,
         tokenizer,
         split="stats",
         num_stats=args.num_samples,
@@ -119,6 +143,7 @@ def main() -> None:
         max_seq_len=args.max_seq_len,
         seed=args.seed,
         prompt_field=args.prompt_field,
+        messages_field=args.messages_field,
         default_prompt_version=args.prompt_version,
     )
     device = getattr(model, "device", "cpu")
@@ -135,7 +160,8 @@ def main() -> None:
     # --- save --------------------------------------------------------------
     stats = {
         "model": args.model,
-        "train_parquet": args.train_parquet,
+        "source": source,
+        "source_kind": "trajectories" if args.trajectories else "train_parquet",
         "num_experts": num_experts,
         "top_k": top_k,
         "norm_topk_prob": norm_topk,

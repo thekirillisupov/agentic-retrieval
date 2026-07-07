@@ -1,20 +1,26 @@
-"""Stage 4: rank candidates by NLL on the held-out slice of the train parquet.
+"""Stage 4: rank candidates by NLL on the held-out slice of the validation domain.
 
-The train parquet is the pipeline's validation domain: rows are shuffled with
-the same seed as the stats pass and the TAIL slice (reserved by
-``collect_stats --val-samples``) is scored, so validation never sees the rows
-that drove expert selection.
+Rows of the data source are shuffled with the same seed as the stats pass and
+the TAIL slice (reserved by ``collect_stats --val-samples``) is scored, so
+validation never sees the rows that drove expert selection. Pass the SAME
+source (--train-parquet or --trajectories), --num-samples, --val-samples and
+--seed as collect_stats — otherwise the disjoint-split guarantee is void.
+
+With --trajectories the score covers full multi-turn rollouts (tool calls +
+tool results), so the NLL also measures how well the pruned model still
+predicts the tokens it emits while processing search results — use it when
+stats were collected from trajectories.
 
 Each candidate (the unpruned W8A8 baseline, pruned variants at different keep
 levels, ...) is loaded in turn and scored with teacher-forced mean NLL per
-token over the rendered agentic prompts. Lower is better; the delta against
-the first (baseline) model is the pruning cost on-domain.
+token. Lower is better; the delta against the first (baseline) model is the
+pruning cost on-domain.
 
   python -m prune.validate \
-    --train-parquet data/processed/unioned/grpo_train.parquet \
+    --trajectories trajectories_data/gspo_qwen3_moe/65.jsonl \
     --models base=checkpoints/quantized/qwen3_5_35b_a3b_w8a8 \
              pruned=checkpoints/pruned/qwen3_5_35b_a3b_w8a8/model \
-    --num-samples 512 --val-samples 128 \
+    --num-samples 512 --val-samples 128 --max-seq-len 8192 \
     --output checkpoints/pruned/qwen3_5_35b_a3b_w8a8/validation.json
 
 NLL on-domain is a cheap smoke test, not the accept gate. The accept gate is
@@ -56,7 +62,11 @@ def _score_model(model_dir: str, ds, *, dtype: str, device_map: str) -> dict:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--train-parquet", required=True)
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--train-parquet",
+                     help="Same parquet as collect_stats --train-parquet.")
+    src.add_argument("--trajectories",
+                     help="Same trajectory JSONL as collect_stats --trajectories.")
     ap.add_argument(
         "--models",
         required=True,
@@ -72,7 +82,10 @@ def main() -> None:
     ap.add_argument("--max-seq-len", type=int, default=4096)
     ap.add_argument("--seed", type=int, default=0,
                     help="MUST match collect_stats --seed.")
-    ap.add_argument("--prompt-field", default="prompt")
+    ap.add_argument("--prompt-field", default="prompt",
+                    help="Parquet column with message arrays (--train-parquet only).")
+    ap.add_argument("--messages-field", default="messages_full",
+                    help="JSONL key with the full rollout (--trajectories only).")
     ap.add_argument("--prompt-version", default="v2_search_only")
     ap.add_argument("--dtype", default="bfloat16")
     ap.add_argument("--device-map", default="auto")
@@ -92,8 +105,9 @@ def main() -> None:
     # One tokenizer for everyone: pruning does not touch the tokenizer, and a
     # shared tokenization keeps the token counts comparable across candidates.
     tokenizer = AutoTokenizer.from_pretrained(candidates[0][1], trust_remote_code=True)
+    source = args.train_parquet or args.trajectories
     ds = load_split(
-        args.train_parquet,
+        source,
         tokenizer,
         split="val",
         num_stats=args.num_samples,
@@ -101,6 +115,7 @@ def main() -> None:
         max_seq_len=args.max_seq_len,
         seed=args.seed,
         prompt_field=args.prompt_field,
+        messages_field=args.messages_field,
         default_prompt_version=args.prompt_version,
     )
     print(f"[validate] {len(ds)} held-out sequences")
@@ -122,7 +137,8 @@ def main() -> None:
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     report = {
-        "train_parquet": args.train_parquet,
+        "source": source,
+        "source_kind": "trajectories" if args.trajectories else "train_parquet",
         "val_samples": args.val_samples,
         "max_seq_len": args.max_seq_len,
         "seed": args.seed,

@@ -11,6 +11,7 @@ from typing import Any
 
 from quantize.calibration import (
     build_calibration_from_messages,
+    load_messages_from_trajectory_jsonl,
     load_messages_from_trajectory_parquet,
 )
 
@@ -85,8 +86,33 @@ def free_model(model) -> None:
         torch.cuda.empty_cache()
 
 
+def split_pool(
+    items: list, *, split: str, num_stats: int, num_val: int, seed: int = 0
+) -> list:
+    """Deterministic disjoint stats/val slices of one row pool.
+
+    The same data file doubles as the pipeline's validation domain, so the two
+    consumers must not overlap: after one shuffle(seed) the stats pass reads
+    rows [:num_stats] and validation reads rows [-num_val:]. Overlap is an
+    error — shrink the sample sizes rather than validating on rows the
+    selection already saw.
+    """
+    import random
+
+    if split not in ("stats", "val"):
+        raise ValueError(f"split must be 'stats' or 'val', got {split!r}")
+    if num_stats + num_val > len(items):
+        raise ValueError(
+            f"stats ({num_stats}) + val ({num_val}) samples exceed available rows "
+            f"({len(items)}) — the val slice would overlap the stats slice"
+        )
+    pool = list(items)
+    random.Random(seed).shuffle(pool)
+    return pool[:num_stats] if split == "stats" else pool[len(pool) - num_val :]
+
+
 def load_split(
-    parquet: str | Path,
+    source: str | Path,
     tokenizer: Any,
     *,
     split: str,
@@ -95,44 +121,53 @@ def load_split(
     max_seq_len: int,
     seed: int = 0,
     prompt_field: str = "prompt",
+    messages_field: str = "messages_full",
     default_prompt_version: str = "v2_search_only",
 ):
-    """Deterministic stats/val split of the train parquet, tokenized.
+    """Tokenized stats/val split of the validation-domain data.
 
-    The train parquet doubles as the pipeline's validation domain, so the two
-    consumers must not overlap: after one shuffle(seed) the stats pass reads
-    rows [:num_stats] and validation reads rows [-num_val:]. Overlap is an
-    error — shrink the sample sizes rather than validating on rows the
-    selection already saw.
+    Two source formats (same convention as quantize/quantize.py --trajectories):
+
+    * ``.parquet`` — grpo_train.parquet ``prompt`` column: single-turn
+      [system, user] prompts, rendered with ``add_generation_prompt=True`` to
+      match inference. Covers the prompt-encoding distribution only.
+    * ``.jsonl`` — trajectory files (``messages_full``): complete multi-turn
+      rollouts including tool calls AND tool results, tokenized verbatim
+      (``add_generation_prompt=False``). Routes tokens through the experts
+      that only fire while the model processes search results / reasons
+      between calls — the higher-fidelity source for expert pruning.
+
+    Stats and val consumers must pass identical num_stats/num_val/seed AND the
+    same source file, or the disjoint-split guarantee (see split_pool) is void.
 
     Returns a datasets.Dataset with input_ids/attention_mask (same rendering
-    path as quantization calibration: chat template + tool schemas +
-    add_generation_prompt, see quantize/calibration.py).
+    path as quantization calibration: chat template + per-row prompt_version
+    tool schemas, see quantize/calibration.py).
     """
-    import random
-
-    if split not in ("stats", "val"):
-        raise ValueError(f"split must be 'stats' or 'val', got {split!r}")
-
-    msgs = load_messages_from_trajectory_parquet(
-        parquet,
-        prompt_field=prompt_field,
-        default_prompt_version=default_prompt_version,
-    )
-    if num_stats + num_val > len(msgs):
-        raise ValueError(
-            f"stats ({num_stats}) + val ({num_val}) samples exceed parquet rows "
-            f"({len(msgs)}) — the val slice would overlap the stats slice"
+    source = Path(source)
+    if source.suffix.lower() == ".parquet":
+        msgs = load_messages_from_trajectory_parquet(
+            source,
+            prompt_field=prompt_field,
+            default_prompt_version=default_prompt_version,
         )
-    random.Random(seed).shuffle(msgs)
-    pool = msgs[:num_stats] if split == "stats" else msgs[len(msgs) - num_val :]
+        add_generation_prompt = True
+    else:
+        msgs = load_messages_from_trajectory_jsonl(
+            source,
+            messages_field=messages_field,
+            default_prompt_version=default_prompt_version,
+        )
+        add_generation_prompt = False
 
+    pool = split_pool(
+        msgs, split=split, num_stats=num_stats, num_val=num_val, seed=seed
+    )
     return build_calibration_from_messages(
         pool,
         tokenizer,
         num_samples=len(pool),
         max_seq_len=max_seq_len,
-        # Parquet prompts are single-turn [system, user]: match inference.
-        add_generation_prompt=True,
+        add_generation_prompt=add_generation_prompt,
         seed=seed,
     )

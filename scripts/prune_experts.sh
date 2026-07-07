@@ -13,6 +13,12 @@
 #   WORKDIR=checkpoints/pruned/qwen3_5_35b_a3b_w8a8 \
 #   bash scripts/prune_experts.sh
 #
+# Preferred data source: recorded multi-turn rollouts (tool calls + tool
+# results — activates the experts single-turn prompts never touch). Setting
+# TRAJECTORIES switches BOTH the stats pass and validation to the JSONL:
+#   TRAJECTORIES=trajectories_data/gspo_qwen3_moe/65.jsonl \
+#   MAX_SEQ_LEN=8192 bash scripts/prune_experts.sh
+#
 # Run in the inference/quant venv (llmcompressor pulls in compressed-tensors,
 # needed to load the W8A8 candidate) — NOT the Megatron training env.
 set -euo pipefail
@@ -21,6 +27,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 MODEL="${MODEL:-checkpoints/quantized/qwen3_5_35b_a3b_w8a8}"
 TRAIN_PARQUET="${TRAIN_PARQUET:-data/processed/unioned/grpo_train.parquet}"
+TRAJECTORIES="${TRAJECTORIES:-}"    # trajectory JSONL; overrides TRAIN_PARQUET
 WORKDIR="${WORKDIR:-checkpoints/pruned/$(basename "${MODEL}")}"
 
 KEEP="${KEEP:-}"                 # fixed experts kept per layer; overrides COVERAGE
@@ -43,13 +50,23 @@ else
   SELECT_ARGS=(--coverage "${COVERAGE}")
 fi
 
+# The stats pass and validation MUST read the same source (and the same
+# NUM_SAMPLES/VAL_SAMPLES/SEED) to keep their slices disjoint.
+if [[ -n "${TRAJECTORIES}" ]]; then
+  DATA_ARGS=(--trajectories "${TRAJECTORIES}")
+  DATA_DESC="${TRAJECTORIES} (full rollouts incl. tool results)"
+else
+  DATA_ARGS=(--train-parquet "${TRAIN_PARQUET}")
+  DATA_DESC="${TRAIN_PARQUET} (single-turn prompts)"
+fi
+
 cd "${REPO_ROOT}"
 mkdir -p "${WORKDIR}"
 
-echo "== [1/4] router stats on ${TRAIN_PARQUET} =="
+echo "== [1/4] router stats on ${DATA_DESC} =="
 python -m prune.collect_stats \
   --model "${MODEL}" \
-  --train-parquet "${TRAIN_PARQUET}" \
+  "${DATA_ARGS[@]}" \
   --output "${STATS}" \
   --num-samples "${NUM_SAMPLES}" \
   --val-samples "${VAL_SAMPLES}" \
@@ -70,9 +87,9 @@ python -m prune.apply \
   --plan "${PLAN}" \
   --output "${PRUNED}"
 
-echo "== [4/4] validate on held-out train-parquet slice =="
+echo "== [4/4] validate on held-out slice of ${DATA_DESC} =="
 python -m prune.validate \
-  --train-parquet "${TRAIN_PARQUET}" \
+  "${DATA_ARGS[@]}" \
   --models "base=${MODEL}" "pruned=${PRUNED}" \
   --output "${REPORT}" \
   --num-samples "${NUM_SAMPLES}" \

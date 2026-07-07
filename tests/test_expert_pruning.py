@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import pytest
 
+from prune.common import split_pool
 from prune.plan import select_experts, summarize_plan
 from prune.remap import PlanIndex, plan_tensor, update_config_num_experts
 
@@ -161,6 +162,40 @@ def test_layer_not_in_plan_untouched():
     assert plan_tensor(name, index) == ("keep", name)
     gate = "model.layers.7.mlp.gate.weight"
     assert plan_tensor(gate, index) == ("keep", gate)
+
+
+# ------------------------------------------------------------------- split
+
+
+def test_split_pool_stats_and_val_are_disjoint():
+    items = list(range(100))
+    stats = split_pool(items, split="stats", num_stats=60, num_val=30, seed=0)
+    val = split_pool(items, split="val", num_stats=60, num_val=30, seed=0)
+    assert len(stats) == 60 and len(val) == 30
+    assert not set(stats) & set(val)
+
+
+def test_split_pool_deterministic_across_calls():
+    items = list(range(50))
+    a = split_pool(items, split="val", num_stats=20, num_val=10, seed=7)
+    b = split_pool(items, split="val", num_stats=20, num_val=10, seed=7)
+    assert a == b
+
+
+def test_split_pool_overlap_raises():
+    with pytest.raises(ValueError):
+        split_pool(list(range(10)), split="stats", num_stats=8, num_val=3, seed=0)
+
+
+def test_split_pool_bad_split_name():
+    with pytest.raises(ValueError):
+        split_pool(list(range(10)), split="test", num_stats=4, num_val=4, seed=0)
+
+
+def test_split_pool_does_not_mutate_input():
+    items = list(range(20))
+    split_pool(items, split="stats", num_stats=5, num_val=5, seed=3)
+    assert items == list(range(20))
 
 
 # ------------------------------------------------------------------- config
