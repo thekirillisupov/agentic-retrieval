@@ -59,10 +59,10 @@ def main() -> None:
     )
     ap.add_argument("--output", required=True, help="Where to write router_stats.json.")
     ap.add_argument("--num-samples", type=int, default=512,
-                    help="Rows used for the stats pass (front of the shuffled pool).")
+                    help="Rows used for the stats pass (random sample, seed).")
     ap.add_argument("--val-samples", type=int, default=128,
-                    help="Rows RESERVED for prune.validate (tail of the shuffled "
-                    "pool). Reserved here so the two stages cannot overlap.")
+                    help="Rows RESERVED for prune.validate (random sample, same "
+                    "seed as stats). Reserved here so the two stages cannot overlap.")
     ap.add_argument("--max-seq-len", type=int, default=4096,
                     help="Truncation length; raise (e.g. 8192) for --trajectories, "
                     "multi-turn rollouts are much longer than bare prompts.")

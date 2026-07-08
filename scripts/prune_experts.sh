@@ -21,6 +21,14 @@
 #
 # Run in the inference/quant venv (llmcompressor pulls in compressed-tensors,
 # needed to load the W8A8 candidate) — NOT the Megatron training env.
+#
+#
+# MODEL=checkpoints/hf_model_3_step_ndcg \
+# TRAJECTORIES=trajectories_data/gspo_qwen3_moe/60.jsonl \
+# COVERAGE=0.995 MAX_SEQ_LEN=16192 \
+# NUM_SAMPLES=818 VAL_SAMPLES=128 \
+# bash scripts/prune_experts.sh
+
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -33,8 +41,8 @@ WORKDIR="${WORKDIR:-checkpoints/pruned/$(basename "${MODEL}")}"
 KEEP="${KEEP:-}"                 # fixed experts kept per layer; overrides COVERAGE
 COVERAGE="${COVERAGE:-0.99}"     # min router-mass every layer must retain
 METRIC="${METRIC:-mass}"
-NUM_SAMPLES="${NUM_SAMPLES:-512}"   # stats slice (head of shuffled parquet)
-VAL_SAMPLES="${VAL_SAMPLES:-128}"   # held-out slice (tail), reserved from stats
+NUM_SAMPLES="${NUM_SAMPLES:-512}"   # stats slice (random sample, SEED)
+VAL_SAMPLES="${VAL_SAMPLES:-128}"   # held-out slice (disjoint random sample)
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-4096}"
 SEED="${SEED:-0}"
 PROMPT_VERSION="${PROMPT_VERSION:-v2_search_only}"

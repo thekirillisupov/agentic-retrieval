@@ -89,26 +89,34 @@ def free_model(model) -> None:
 def split_pool(
     items: list, *, split: str, num_stats: int, num_val: int, seed: int = 0
 ) -> list:
-    """Deterministic disjoint stats/val slices of one row pool.
+    """Deterministic disjoint random stats/val slices of one row pool.
 
     The same data file doubles as the pipeline's validation domain, so the two
-    consumers must not overlap: after one shuffle(seed) the stats pass reads
-    rows [:num_stats] and validation reads rows [-num_val:]. Overlap is an
-    error — shrink the sample sizes rather than validating on rows the
-    selection already saw.
+    consumers must not overlap: ``random.sample(seed)`` draws ``num_stats +
+    num_val`` rows without replacement; the stats pass gets the first
+    ``num_stats`` and validation gets the rest. Overlap is an error — shrink
+    the sample sizes rather than validating on rows the selection already saw.
     """
     import random
 
     if split not in ("stats", "val"):
         raise ValueError(f"split must be 'stats' or 'val', got {split!r}")
-    if num_stats + num_val > len(items):
+    n_need = num_stats + num_val
+    if n_need > len(items):
         raise ValueError(
             f"stats ({num_stats}) + val ({num_val}) samples exceed available rows "
             f"({len(items)}) — the val slice would overlap the stats slice"
         )
-    pool = list(items)
-    random.Random(seed).shuffle(pool)
-    return pool[:num_stats] if split == "stats" else pool[len(pool) - num_val :]
+    rng = random.Random(seed)
+    if len(items) == n_need:
+        chosen = list(items)
+    else:
+        chosen = rng.sample(items, n_need)
+        print(
+            f"[prune] randomly sampled {n_need}/{len(items)} rows for "
+            f"stats+val (seed={seed})"
+        )
+    return chosen[:num_stats] if split == "stats" else chosen[num_stats:]
 
 
 def load_split(
@@ -145,6 +153,7 @@ def load_split(
     tool schemas, see quantize/calibration.py).
     """
     source = Path(source)
+    n_need = num_stats + num_val
     if source.suffix.lower() == ".parquet":
         msgs = load_messages_from_trajectory_parquet(
             source,
@@ -157,6 +166,8 @@ def load_split(
             source,
             messages_field=messages_field,
             default_prompt_version=default_prompt_version,
+            max_rows=n_need,
+            seed=seed,
         )
         add_generation_prompt = False
 
@@ -169,5 +180,5 @@ def load_split(
         num_samples=len(pool),
         max_seq_len=max_seq_len,
         add_generation_prompt=add_generation_prompt,
-        seed=seed,
+        shuffle=False,
     )

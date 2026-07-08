@@ -61,7 +61,7 @@ def main() -> None:
     # --- rewrite shards -----------------------------------------------------
     weight_map: dict[str, str] = {}
     total_size = 0
-    dropped = renamed = sliced = kept = 0
+    dropped = renamed = sliced_gate = sliced_expert = kept = 0
     shard_paths = _shards(model_dir)
     for shard_path in shard_paths:
         tensors = load_file(str(shard_path))
@@ -81,7 +81,10 @@ def main() -> None:
                         f"{index.num_experts_orig}; refusing to slice"
                     )
                 out_tensors[name] = t[arg].contiguous()
-                sliced += 1
+                if ".mlp.gate." in name:
+                    sliced_gate += 1
+                else:
+                    sliced_expert += 1
             else:
                 out_tensors[name] = t
                 kept += 1
@@ -92,10 +95,12 @@ def main() -> None:
         print(f"[apply] {shard_path.name}: wrote {len(out_tensors)} tensors")
 
     print(
-        f"[apply] tensors: kept={kept} renamed={renamed} sliced(gate)={sliced} "
+        f"[apply] tensors: kept={kept} renamed={renamed} "
+        f"sliced(gate)={sliced_gate} sliced(expert)={sliced_expert} "
         f"dropped={dropped}"
     )
-    if sliced == 0 or renamed == 0:
+    experts_touched = renamed > 0 or dropped > 0 or sliced_expert > 0
+    if not experts_touched or sliced_gate == 0:
         raise RuntimeError(
             "no expert/gate tensors were touched — tensor names did not match "
             "the expected layout (see prune/remap.py)"

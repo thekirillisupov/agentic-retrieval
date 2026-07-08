@@ -8,8 +8,12 @@ renamed together with their module, so no scheme-specific handling is needed.
 
 Touched tensors:
 
-  *.layers.{L}.mlp.experts.{E}.<rest>   dropped, or renamed to the expert's
-                                        new contiguous index.
+  *.layers.{L}.mlp.experts.{E}.<rest>   per-expert layout (W8A8, some bf16
+                                        actors): dropped, or renamed to the
+                                        expert's new contiguous index.
+  *.layers.{L}.mlp.experts.<rest>       fused layout (Qwen3 MoE packs all
+                                        experts into one tensor, dim 0 ==
+                                        num_experts): rows sliced to kept ids.
   *.layers.{L}.mlp.gate.<rest>          router Linear — rows sliced down to
                                         the kept experts (dim 0 == num_experts
                                         for both weight [E, H] and bias [E]).
@@ -27,6 +31,10 @@ from typing import Any
 # ("model.language_model.layers.N...") end with the same suffix.
 EXPERT_RE = re.compile(
     r"^(?P<prefix>.*\.layers\.(?P<layer>\d+)\.mlp\.experts\.)(?P<expert>\d+)\.(?P<rest>.+)$"
+)
+# Fused expert weights: experts.gate_up_proj / experts.down_proj (no per-expert index).
+FUSED_EXPERT_RE = re.compile(
+    r"^.*\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<rest>[a-zA-Z_]\w*)$"
 )
 GATE_RE = re.compile(r"^.*\.layers\.(?P<layer>\d+)\.mlp\.gate\.(?P<rest>.+)$")
 
@@ -67,6 +75,14 @@ def plan_tensor(name: str, index: PlanIndex) -> Action:
         if new is None:
             return ("drop", None)
         return ("rename", f"{m.group('prefix')}{new}.{m.group('rest')}")
+
+    m = FUSED_EXPERT_RE.match(name)
+    if m:
+        layer = int(m.group("layer"))
+        kept = index.kept.get(layer)
+        if kept is None:
+            return ("keep", name)
+        return ("slice0", kept)
 
     m = GATE_RE.match(name)
     if m:

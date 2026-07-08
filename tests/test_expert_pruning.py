@@ -144,6 +144,18 @@ def test_gate_tensor_sliced():
     assert kept == [0, 2]
 
 
+@pytest.mark.parametrize(
+    "prefix",
+    ["model.layers", "model.language_model.layers"],
+)
+def test_fused_expert_tensors_sliced(prefix):
+    index = make_plan({3: [1, 3, 7]})
+    for suffix in ("gate_up_proj", "down_proj"):
+        kind, kept = plan_tensor(f"{prefix}.3.mlp.experts.{suffix}", index)
+        assert kind == "slice0"
+        assert kept == [1, 3, 7]
+
+
 def test_shared_expert_and_other_tensors_untouched():
     index = make_plan({0: [0, 1]})
     for name in (
