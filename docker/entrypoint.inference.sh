@@ -25,9 +25,20 @@ ENABLE_THINKING="${ENABLE_THINKING:-false}"
 # --- harness service ---
 AGENT_HOST="${AGENT_HOST:-0.0.0.0}"
 AGENT_PORT="${AGENT_PORT:-8080}"
+# Default: the in-repo tool server (search.backend: local). Set
+# AGENT_CONFIG=configs/ift_inference.yaml to run against the external
+# GigaSearch `universal_search` skill instead (search.backend: gigasearch;
+# mirrors scripts/DEMO.ipynb).
 export AGENT_CONFIG="${AGENT_CONFIG:-configs/inference.yaml}"
-# The external retrieval service (embedder + reranker + index). REQUIRED.
+# The external retrieval service (embedder + reranker + index), e.g. the
+# GigaSearch host from scripts/DEMO.ipynb. REQUIRED.
 export SEARCH_URL="${SEARCH_URL:-http://localhost:8100}"
+# Optional overrides of AGENT_CONFIG's search.* block; leave unset to use the
+# values baked into AGENT_CONFIG.
+#   SEARCH_BACKEND         -> search.backend ("gigasearch" | "local")
+#   GIGASEARCH_SOURCE_UUID -> search.gigasearch.source_uuid
+export SEARCH_BACKEND="${SEARCH_BACKEND:-}"
+export GIGASEARCH_SOURCE_UUID="${GIGASEARCH_SOURCE_UUID:-}"
 # Wire the harness to the co-located vLLM and the served model name.
 export VLLM_URL="${VLLM_URL:-http://localhost:${VLLM_PORT}/v1}"
 export MODEL_NAME="${MODEL_NAME:-${SERVED_MODEL_NAME}}"

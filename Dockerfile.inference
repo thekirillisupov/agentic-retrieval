@@ -30,7 +30,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl \
 # Harness-side deps. Most already ship in the vLLM image (openai, fastapi,
 # uvicorn, pydantic); pin the rest. --no-deps-free install is fine here.
 RUN pip install "httpx>=0.27" "pyyaml>=6" "uvicorn[standard]>=0.30" \
-    "fastapi>=0.110" "openai>=1.40"
+    "fastapi>=0.110" "openai>=1.40" "opensearch-py>=2.4"
 
 WORKDIR /app
 

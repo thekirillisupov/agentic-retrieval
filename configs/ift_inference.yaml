@@ -1,0 +1,178 @@
+# Inference config for the agentic-retrieval image, wired to the ИФТ GigaSearch
+# stand instead of the in-repo tool server.
+#
+# Only what the harness needs at serving time: how to reach the local vLLM, how
+# to reach the EXTERNAL search service, and the agent knobs. No embedder /
+# reranker / faiss sections — those live behind the GigaSearch `universal_search`
+# skill (see search.backend below; mirrors scripts/DEMO.ipynb).
+#
+# Point AGENT_CONFIG at this file (instead of the default configs/inference.yaml)
+# to run against GigaSearch, e.g.: AGENT_CONFIG=configs/ift_inference.yaml
+#
+# Env overrides applied by agent/service.py: VLLM_URL, MODEL_NAME, SEARCH_URL,
+# SEARCH_BACKEND, GIGASEARCH_SOURCE_UUID.
+
+model:
+  # Which backend serves the model:
+  #   openai -> vLLM / OpenAI-compatible server (this image's local vLLM)
+  #   http   -> a raw JSON endpoint (this block; mirrors the reference curl)
+  backend: http
+  # Call the external model over a raw JSON endpoint. The body mirrors the
+  # reference curl; the agent loop needs tool-calling, so the endpoint must
+  # accept tools/tool_choice and return OpenAI-style tool_calls (keep
+  # send_tools: true).
+  name: agentic-retrieval
+  url: https://sm.apps.dev-terra000003-ids.ocp.delta.sbrf.ru/qwen_35
+  timeout_s: 120
+  include_model: false       # the sample curl omits "model"
+  send_tools: true           # forward tools/tool_choice (required for search)
+  max_tokens: 32768
+  temperature: 0.1
+  extra_body:                # merged into every request body
+    top_p: 0.95
+    reasoning: false
+    chat_template_kwargs:
+      enable_thinking: false
+  tls:
+    cert_file: gigachat/published.pem            # curl --cert
+    key_file: gigachat/00CA0001CLLMllm99usr.key  # curl --key
+    verify: false                                # curl --insecure
+  # HF name or local dir of the model's tokenizer. Only needed when
+  # agent.max_passage_tokens > 0 (the harness talks to the model over an API
+  # and has no tokenizer of its own).
+  # tokenizer_path: /models/agentic-retrieval
+
+  # --- Alternative: local vLLM / OpenAI-compatible server ---
+  # backend: openai
+  # # Must match vLLM's --served-model-name (see docker/entrypoint.inference.sh),
+  # # NOT the on-disk weight path, so the harness is decoupled from the mount point.
+  # vllm_url: http://localhost:8000/v1
+  # api_key: EMPTY
+  # # Mutual TLS also applies to the openai backend (OpenAI API behind mTLS):
+  # tls:
+  #   cert_file: gigachat/published.pem
+  #   key_file: gigachat/00CA0001CLLMllm99usr.key
+  #   verify: false            # curl --insecure; or a CA-bundle path
+
+search:
+  # Which retrieval service the harness calls for `search`/`local_search`
+  # (and, where supported, `grep`/`get_neighbours`):
+  #   gigasearch -> an external GigaSearch `universal_search` skill. Mirrors
+  #                 scripts/DEMO.ipynb: an mTLS-authenticated POST to
+  #                 `{url}/sync/skill/universal_search`, with the retrieval
+  #                 pipeline itself (embedder/reranker/index_id) pinned by the
+  #                 `configuration` json below, not by this harness. GigaSearch
+  #                 has no grep equivalent (empty hits). When
+  #                 `gigasearch.opensearch` is set, `get_neighbours` is served
+  #                 by direct OpenSearch queries (same logic as DEMO.ipynb).
+  #   local      -> the in-repo tool server (a simple JSON `/local_search`
+  #                 route; see the commented block below, and
+  #                 configs/inference.yaml for the default deployment).
+  # Override at runtime with SEARCH_BACKEND.
+  backend: gigasearch
+  # Base URL of the retrieval service. Override at runtime with SEARCH_URL.
+  # The model only fills the query; the caller pins everything else via the
+  # request's `search_params`.
+  url: https://sm.apps.dev-terra000003-ids.ocp.delta.sbrf.ru
+  timeout_s: 30
+
+  # --- backend: gigasearch ---
+  gigasearch:
+    # source_uuid from your GigaSearch skill registration (`SOURCE_ID` in
+    # scripts/DEMO.ipynb). Override at runtime with GIGASEARCH_SOURCE_UUID.
+    source_uuid: eb3669d8-7773-44d6-83a9-41e1d6f5448e
+    skill: universal_search
+    predict_path: /predict
+    # Inner `timeout` field of the skill request body — how long the
+    # GigaSearch pipeline itself is allowed to run. Separate from `timeout_s`
+    # above, which bounds the harness's own HTTP wait.
+    request_timeout_s: 300
+    # The GigaSearch agent_configuration json (embedder/reranker/index_id/…) —
+    # exactly the `config` loaded in scripts/DEMO.ipynb — kept as its own file
+    # since it's versioned/managed separately from the harness.
+    config_path: configs/search_config.v.0.2.4.json
+    # Mutual TLS, same cert/key as scripts/DEMO.ipynb's `cert=(...)`.
+    tls:
+      cert_file: gigachat/published.pem
+      key_file: gigachat/00CA0001CLLMllm99usr.key
+      verify: false      # curl --insecure / requests verify=False
+    # How to flatten one GigaSearch hit
+    # (result.response.messages[-1].faq_sources[i], see scripts/DEMO.ipynb for
+    # a full example) into the canonical doc_id/title/text/score/file_name/
+    # index shape. Dotted paths reach into nested objects (e.g.
+    # "metadata.raw_text"). Defaults below match the `universal_search`
+    # skill's current response shape, so this whole block is optional.
+    response:
+      fields:
+        doc_id: faq_id
+        score: relevance_score
+        text: metadata.raw_text
+        title: metadata.breadcrumbs
+        file_name: metadata.file_name
+        index: metadata.passage_index
+    # Direct OpenSearch access for get_neighbours (scripts/DEMO.ipynb). Search
+    # still goes through GigaSearch; only chunk adjacency uses OpenSearch.
+    # `index_id` defaults to data_sources_faq[0].index_id from config_path.
+    opensearch:
+      port: 443
+      url_prefix: /opensearch
+      tls:
+        cert_file: gigachat/published.pem
+        key_file: gigachat/00CA0001CLLMllm99usr.key
+        verify: false
+
+  # --- Alternative: backend: local (the in-repo tool server) ---
+  # Route names on the external service. Defaults match the in-repo tool server;
+  # point `search` at your `/search` handler if that's how yours is named.
+  # endpoints:
+  #   search: /local_search
+  #   grep: /grep
+  #   get_neighbours: /get_neighbours
+  # How to read the search / get_neighbours JSON response. Defaults below match
+  # the in-repo tool server, so this whole block is optional — set it only if
+  # your service names things differently.
+  # response:
+  #   results_key: results            # top-level list of result items
+  #   status_key: status              # get_neighbours: "ok"/"unknown_doc"/…
+  #   total_matches_key: total_matches  # grep: total hit count
+  #   # canonical field the harness needs -> field name in each result item.
+  #   # e.g. if your service returns {"id": ..., "chunk": ..., "relevance": ...}:
+  #   #   fields: {doc_id: id, text: chunk, score: relevance}
+  #   fields:
+  #     doc_id: doc_id
+  #     title: title
+  #     text: text
+  #     score: score
+  #     file_name: file_name
+  #     index: index
+
+agent:
+  # v2 = search + get_neighbours (matches the trained tool set). max_tool_calls,
+  # use_id_map and tool_budget_feedback MUST match the training/eval config the
+  # weights were produced with (mirrors configs/ckr.yaml).
+  # get_neighbours is backed by search.gigasearch.opensearch above (OpenSearch
+  # mTLS, same as scripts/DEMO.ipynb). Omit that block to degrade to
+  # "no_metadata" instead.
+  prompt_version: v2
+  max_turns: 8
+  max_tool_calls: 3
+  top_k_default: 8
+  top_k_max: 50
+  use_id_map: false
+  tool_budget_feedback: true
+  # Tool-response budgets. MUST match the training run — the policy only ever
+  # saw tool responses fitted to these budgets, so serving without them shows
+  # the model contexts it was never trained on. Mirror the training config's
+  # rollout.multi_turn.max_tool_response_length / tool_response_truncate_side
+  # (configs/gspo_qwen3_moe.yaml: 10240 / left).
+  max_tool_response_length: 10240
+  tool_response_truncate_side: left
+  # Per-passage token cap, applied to each hit's text BEFORE the total-response
+  # char budget (training config's agent_loop.retrieval_react.max_passage_tokens;
+  # gspo_qwen3_moe.yaml used 512). Enabling it requires model.tokenizer_path
+  # (HF name or local dir) so the harness can tokenize passages; 0 disables.
+  max_passage_tokens: 0
+
+service:
+  host: 0.0.0.0
+  port: 8080

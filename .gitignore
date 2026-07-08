@@ -29,3 +29,6 @@ wandb/
 .DS_Store
 checkpoints/
 nohup.out
+gigachat/
+data/
+search_configs/

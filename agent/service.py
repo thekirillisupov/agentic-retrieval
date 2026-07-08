@@ -20,6 +20,7 @@ container entrypoint can wire things up without editing the file.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from dataclasses import asdict
@@ -31,7 +32,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from agent.episode import tool_budget_kwargs_from_cfg
-from agent.harness import AgentHarness, ToolServerClient
+from agent.harness import AgentHarness, GigaSearchClient, ToolServerClient
 from agent.model_client import build_model_client
 from agent.prompts import PROFILES
 from agent.schemas import AgentInput, Message
@@ -53,7 +54,9 @@ def load_config(path: str | None = None) -> dict[str, Any]:
     the external search service without rewriting the yaml:
       * ``VLLM_URL``   -> model.vllm_url
       * ``MODEL_NAME`` -> model.name (must match vLLM's --served-model-name)
-      * ``SEARCH_URL`` -> search.url (base URL of the external retrieval service)
+      * ``SEARCH_URL``     -> search.url (base URL of the external retrieval service)
+      * ``SEARCH_BACKEND`` -> search.backend ("local" | "gigasearch")
+      * ``GIGASEARCH_SOURCE_UUID`` -> search.gigasearch.source_uuid
     """
     cfg_path = Path(path or os.environ.get("AGENT_CONFIG", DEFAULT_CONFIG))
     cfg: dict[str, Any] = yaml.safe_load(cfg_path.read_text())
@@ -69,6 +72,13 @@ def load_config(path: str | None = None) -> dict[str, Any]:
         cfg["model"]["name"] = os.environ["MODEL_NAME"]
     if os.environ.get("SEARCH_URL"):
         cfg["search"]["url"] = os.environ["SEARCH_URL"]
+    if os.environ.get("SEARCH_BACKEND"):
+        cfg["search"]["backend"] = os.environ["SEARCH_BACKEND"]
+    if os.environ.get("GIGASEARCH_SOURCE_UUID"):
+        cfg["search"].setdefault("gigasearch", {})
+        cfg["search"]["gigasearch"]["source_uuid"] = os.environ[
+            "GIGASEARCH_SOURCE_UUID"
+        ]
 
     return cfg
 
@@ -120,6 +130,7 @@ def create_app(config_path: str | None = None) -> FastAPI:
     search_cfg = cfg["search"]
     agent_cfg = cfg["agent"]
     endpoints = search_cfg.get("endpoints", {}) or {}
+    search_backend = str(search_cfg.get("backend", "local")).lower()
 
     # Built once (backend config is static) and reused across requests: an
     # OpenAI/vLLM client or an http backend (raw endpoint behind mTLS).
@@ -130,7 +141,45 @@ def create_app(config_path: str | None = None) -> FastAPI:
     # agent.max_passage_tokens > 0.
     budget_kwargs = tool_budget_kwargs_from_cfg(agent_cfg, model_cfg)
 
-    def _make_tool_client() -> ToolServerClient:
+    # For backend=gigasearch, the retrieval pipeline itself (embedder,
+    # reranker, index_id, …) is pinned by an external agent_configuration json
+    # — exactly the `config` loaded in scripts/DEMO.ipynb — not by this
+    # harness. Loaded once at startup since it's static per deployment.
+    gigasearch_configuration: dict[str, Any] | None = None
+    if search_backend == "gigasearch":
+        gs_cfg = search_cfg.get("gigasearch", {}) or {}
+        config_path = gs_cfg.get("config_path")
+        if not config_path:
+            raise ValueError(
+                "search.gigasearch.config_path is required for "
+                "search.backend=gigasearch (the GigaSearch agent_configuration "
+                "json, e.g. configs/search_config.v.0.2.4.json)"
+            )
+        gigasearch_configuration = json.loads(Path(config_path).read_text())
+
+    def _make_tool_client() -> ToolServerClient | GigaSearchClient:
+        if search_backend == "gigasearch":
+            gs_cfg = search_cfg.get("gigasearch", {}) or {}
+            opensearch_cfg: dict[str, Any] | None = None
+            raw_os = gs_cfg.get("opensearch")
+            if raw_os:
+                opensearch_cfg = dict(raw_os)
+                if not opensearch_cfg.get("host") and not opensearch_cfg.get("url"):
+                    opensearch_cfg["url"] = search_cfg["url"]
+                if not opensearch_cfg.get("tls"):
+                    opensearch_cfg["tls"] = gs_cfg.get("tls")
+            return GigaSearchClient(
+                search_cfg["url"],
+                source_uuid=gs_cfg.get("source_uuid", ""),
+                configuration=gigasearch_configuration or {},
+                skill=gs_cfg.get("skill", "universal_search"),
+                predict_path=gs_cfg.get("predict_path", "/predict"),
+                timeout_s=float(search_cfg.get("timeout_s", 30)),
+                request_timeout_s=float(gs_cfg.get("request_timeout_s", 300)),
+                tls=gs_cfg.get("tls"),
+                response_schema=gs_cfg.get("response"),
+                opensearch_cfg=opensearch_cfg,
+            )
         return ToolServerClient(
             search_cfg["url"],
             timeout_s=float(search_cfg.get("timeout_s", 30)),

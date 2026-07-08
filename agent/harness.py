@@ -128,6 +128,269 @@ class ResponseSchema:
         return out
 
 
+def _default_gigasearch_fields() -> dict[str, str]:
+    # Canonical field the harness needs -> dotted path into one GigaSearch
+    # `faq_sources[i]` item (see GigaSearchResponseSchema). Matches the
+    # `universal_search` skill's current response shape (scripts/DEMO.ipynb).
+    return {
+        "doc_id": "faq_id",
+        "score": "relevance_score",
+        "text": "metadata.raw_text",
+        "title": "metadata.breadcrumbs",
+        "file_name": "metadata.file_name",
+        "index": "metadata.passage_index",
+    }
+
+
+def _get_path(d: dict[str, Any], path: str) -> Any:
+    """Dotted-path lookup, e.g. ``"metadata.raw_text"`` -> ``d["metadata"]["raw_text"]``.
+
+    Returns None (instead of raising) if any segment is missing/not a dict, so
+    a hit with a slightly different shape is skipped rather than crashing the
+    whole search response.
+    """
+    cur: Any = d
+    for part in path.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return None
+        cur = cur[part]
+    return cur
+
+
+@dataclass
+class GigaSearchResponseSchema:
+    """Maps a GigaSearch ``universal_search`` skill response into the
+    canonical shape the harness consumes.
+
+    The skill nests its hits several levels deep —
+    ``result.response.messages[-1].faq_sources[]``, each a
+    ``{faq_id, relevance_score, metadata: {raw_text, file_name, ...}}`` (see
+    scripts/DEMO.ipynb for a full example response) — whereas the rest of the
+    harness (Episode, prompt rendering) only knows the flat
+    ``{doc_id, title, text, score, file_name, index}`` shape ``ResponseSchema``
+    produces for the in-repo tool server. This flattens one into the other so
+    no GigaSearch-specific branches leak past ``GigaSearchClient``. Field
+    paths are configurable (dotted, for nested lookups) under
+    ``search.gigasearch.response.fields``; unset = the defaults above.
+    """
+
+    fields: dict[str, str] = field(default_factory=_default_gigasearch_fields)
+
+    @classmethod
+    def from_config(cls, cfg: dict[str, Any] | None) -> "GigaSearchResponseSchema":
+        merged = _default_gigasearch_fields()
+        if cfg:
+            merged.update(cfg.get("fields") or {})
+        return cls(fields=merged)
+
+    def _item(self, raw: dict[str, Any]) -> dict[str, Any] | None:
+        f = self.fields
+        doc_id = _get_path(raw, f.get("doc_id", "faq_id"))
+        if doc_id is None:
+            log.warning("gigasearch hit missing doc_id field; keys=%s", list(raw))
+            return None
+        out: dict[str, Any] = {
+            "doc_id": str(doc_id),
+            "title": _get_path(raw, f.get("title", "metadata.breadcrumbs")) or "",
+            "text": _get_path(raw, f.get("text", "metadata.raw_text")) or "",
+            "score": float(_get_path(raw, f.get("score", "relevance_score")) or 0.0),
+        }
+        file_name = _get_path(raw, f.get("file_name", "metadata.file_name"))
+        if file_name is not None:
+            out["file_name"] = file_name
+        index = _get_path(raw, f.get("index", "metadata.passage_index"))
+        if index is not None:
+            out["index"] = index
+        return out
+
+    def normalize(
+        self, raw_response: dict[str, Any], top_k: int | None = None
+    ) -> dict[str, Any]:
+        """Pull ``faq_sources`` out of the last assistant message and flatten
+        them into ``{"results": [...], "status": "ok", "total_matches": N}``."""
+        try:
+            messages = raw_response["result"]["response"]["messages"]
+        except (KeyError, TypeError) as e:
+            raise ValueError(
+                "unexpected universal_search response shape (expected "
+                f"result.response.messages); top-level keys={list(raw_response)}"
+            ) from e
+
+        faq_sources: list[dict[str, Any]] = []
+        for msg in reversed(messages):
+            if msg.get("role") == "assistant":
+                faq_sources = msg.get("faq_sources") or []
+                break
+
+        results = [item for r in faq_sources if (item := self._item(r)) is not None]
+        if top_k is not None:
+            results = results[:top_k]
+        return {"results": results, "status": "ok", "total_matches": len(results)}
+
+
+class GigaSearchClient:
+    """Talks to an external GigaSearch ``universal_search`` skill instead of
+    the in-repo tool server — mirrors the reference call in
+    scripts/DEMO.ipynb: an mTLS-authenticated POST to
+    ``{url}/sync/skill/universal_search`` whose body wraps the chat request
+    in ``meta``/``message``/``path``/``timeout``/``configuration``, and whose
+    response nests hits under ``result.response.messages[-1].faq_sources``.
+
+    Only ``search`` is a native GigaSearch capability. ``grep`` has no
+    equivalent there and degrades to empty hits. When
+    ``search.gigasearch.opensearch`` is configured, ``get_neighbours`` is served
+    by direct OpenSearch queries (scripts/DEMO.ipynb); otherwise it degrades to
+  ``no_metadata`` and Episode tells the model to rely on search instead.
+    """
+
+    def __init__(
+        self,
+        url: str,
+        *,
+        source_uuid: str,
+        configuration: dict[str, Any],
+        skill: str = "universal_search",
+        predict_path: str = "/predict",
+        timeout_s: float = 30.0,
+        request_timeout_s: float = 300.0,
+        tls: dict[str, Any] | None = None,
+        response_schema: dict[str, Any] | None = None,
+        opensearch_cfg: dict[str, Any] | None = None,
+    ) -> None:
+        if not source_uuid:
+            raise ValueError(
+                "search.gigasearch.source_uuid is required for backend=gigasearch"
+            )
+        self.url = url.rstrip("/")
+        self.source_uuid = source_uuid
+        self.configuration = configuration
+        self.skill_path = "/sync/skill/" + skill.strip("/")
+        self.predict_path = predict_path
+        # Inner `timeout` field of the skill request body (how long the
+        # GigaSearch pipeline itself may run) — distinct from `timeout_s`,
+        # which bounds the harness's own HTTP wait for the response.
+        self.request_timeout_s = request_timeout_s
+        self.schema = GigaSearchResponseSchema.from_config(response_schema)
+
+        tls = tls or {}
+        cert: Any = None
+        if tls.get("cert_file") and tls.get("key_file"):
+            cert = (tls["cert_file"], tls["key_file"])
+        elif tls.get("cert_file"):
+            cert = tls["cert_file"]
+        self.client = httpx.Client(
+            timeout=timeout_s,
+            cert=cert,
+            verify=tls.get("verify", True),
+            headers={"accept": "application/json", "Content-Type": "application/json"},
+        )
+
+        self._opensearch_client: Any | None = None
+        self._opensearch_index_id: str | None = None
+        if opensearch_cfg:
+            from agent.opensearch_neighbours import (
+                build_opensearch_client,
+                index_id_from_configuration,
+            )
+
+            self._opensearch_client = build_opensearch_client(opensearch_cfg)
+            index_id = opensearch_cfg.get("index_id")
+            self._opensearch_index_id = (
+                str(index_id)
+                if index_id
+                else index_id_from_configuration(configuration)
+            )
+
+    def _predict(
+        self,
+        request: dict[str, Any],
+        *,
+        configuration: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload = {
+            "meta": {
+                "external_uuid": str(uuid.uuid4()),
+                "source_uuid": self.source_uuid,
+            },
+            "message": {"request_type": "chat", "request": request},
+            "path": self.predict_path,
+            "timeout": int(self.request_timeout_s),
+            "configuration": configuration
+            if configuration is not None
+            else self.configuration,
+        }
+        r = self.client.post(f"{self.url}{self.skill_path}", json=payload)
+        r.raise_for_status()
+        return r.json()
+
+    def local_search(
+        self,
+        query: str,
+        top_k: int,
+        source: str | None = None,
+        extra_params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        # `source` (per-episode corpus routing) has no GigaSearch equivalent —
+        # routing lives in `configuration` (index_id), not in this call.
+        # `extra_params` (e.g. {"filters": {...}}, see scripts/DEMO.ipynb) is
+        # merged into the request verbatim; `messages` is applied last so the
+        # model-controlled query always wins.  Callers may also pass
+        # ``extra_params["configuration"]`` to override the deployment-default
+        # GigaSearch pipeline for a single search (see scripts/DEMO_agentic_retrieval.ipynb).
+        request: dict[str, Any] = dict(extra_params or {})
+        configuration = request.pop("configuration", None)
+        request.pop("messages", None)
+        request["messages"] = [{"role": "user", "content": query}]
+        raw = self._predict(
+            request,
+            configuration=configuration if configuration is not None else None,
+        )
+        return self.schema.normalize(raw, top_k=top_k)
+
+    def grep(
+        self,
+        pattern: str,
+        top_k: int,
+        source: str | None = None,
+        extra_params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        # No exact-match equivalent in GigaSearch; degrade to "no matches"
+        # instead of erroring, in case a model still calls it.
+        return {"results": [], "status": "ok", "total_matches": 0}
+
+    def get_neighbours(
+        self,
+        doc_id: str,
+        window: int,
+        source: str | None = None,
+        extra_params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if self._opensearch_client is None:
+            return {"results": [], "status": "no_metadata", "total_matches": 0}
+        if not self._opensearch_index_id:
+            return {"results": [], "status": "no_metadata", "total_matches": 0}
+
+        from agent.opensearch_neighbours import get_neighbours as os_get_neighbours
+
+        resp = os_get_neighbours(
+            self._opensearch_client,
+            self._opensearch_index_id,
+            doc_id,
+            window,
+        )
+        results = resp.get("results", [])
+        return {
+            "results": results,
+            "status": resp.get("status", "ok"),
+            "total_matches": len(results),
+        }
+
+    def close(self) -> None:
+        self.client.close()
+        if self._opensearch_client is not None:
+            self._opensearch_client.close()
+
+
 class ToolServerClient:
     """Thin httpx wrapper around the tool server.
 
