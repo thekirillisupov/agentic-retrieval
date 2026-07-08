@@ -250,6 +250,7 @@ def load_messages_from_trajectory_jsonl(
     messages_field: str = "messages_full",
     default_prompt_version: str = "v2_search_only",
     max_rows: int | None = None,
+    seed: int = 0,
 ) -> list[tuple[list[dict[str, str]], str]]:
     """Load full multi-turn trajectories from a trajectory JSONL file.
 
@@ -259,36 +260,65 @@ def load_messages_from_trajectory_jsonl(
     format produced by the GRPO trainer's ``val_trajectory_dir`` checkpoints
     (e.g. ``trajectories_data/gspo_qwen3_moe/65.jsonl``).
 
+    When ``max_rows`` is set and the file has more non-empty lines, a
+    deterministic random subset (``seed``) is drawn without replacement and
+    only those lines are parsed.
+
     Returns ``(messages, prompt_version)`` tuples.  ``prompt_version`` is read
     from the row's top-level ``prompt_version`` key when present.
     """
     path = Path(path)
+
+    def _parse_row(row: dict) -> tuple[list[dict[str, str]], str] | None:
+        msgs_raw = row.get(messages_field) or []
+        if not msgs_raw:
+            return None
+        msgs = [
+            {"role": str(m["role"]), "content": str(m.get("content") or "")}
+            for m in msgs_raw
+        ]
+        pv = str(row.get("prompt_version", default_prompt_version))
+        return msgs, pv
+
+    non_empty_line_indices: list[int] = []
+    with path.open("r", encoding="utf-8") as f:
+        for i, line in enumerate(f):
+            if line.strip():
+                non_empty_line_indices.append(i)
+
+    picked_indices = non_empty_line_indices
+    if max_rows is not None and len(non_empty_line_indices) > max_rows:
+        picked_indices = random.Random(seed).sample(non_empty_line_indices, max_rows)
+        print(
+            f"[calibration] randomly sampled {len(picked_indices)}/"
+            f"{len(non_empty_line_indices)} lines from {path.name} (seed={seed})"
+        )
+
+    wanted = set(picked_indices)
+    lines_by_index: dict[int, str] = {}
+    with path.open("r", encoding="utf-8") as f:
+        for i, line in enumerate(f):
+            if i in wanted:
+                lines_by_index[i] = line
+            if len(lines_by_index) == len(wanted):
+                break
+
     out: list[tuple[list[dict[str, str]], str]] = []
     skipped = 0
-    with path.open("r", encoding="utf-8") as f:
-        for line_no, line in enumerate(f, start=1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError as exc:
-                print(f"[calibration] warning: skip line {line_no}: {exc}")
-                skipped += 1
-                continue
+    for line_no in picked_indices:
+        line = lines_by_index[line_no].strip()
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            print(f"[calibration] warning: skip line {line_no + 1}: {exc}")
+            skipped += 1
+            continue
 
-            msgs_raw = row.get(messages_field) or []
-            if not msgs_raw:
-                skipped += 1
-                continue
-
-            msgs = [{"role": str(m["role"]), "content": str(m.get("content") or "")}
-                    for m in msgs_raw]
-            pv = str(row.get("prompt_version", default_prompt_version))
-            out.append((msgs, pv))
-
-            if max_rows and len(out) >= max_rows:
-                break
+        parsed = _parse_row(row)
+        if parsed is None:
+            skipped += 1
+            continue
+        out.append(parsed)
 
     print(
         f"[calibration] loaded {len(out)} trajectories from {path.name} "
@@ -306,6 +336,7 @@ def build_calibration_from_messages(
     add_generation_prompt: bool = False,
     enable_thinking: bool = False,
     seed: int = 0,
+    shuffle: bool = True,
 ):
     """Tokenise pre-built message arrays into a HF Dataset for llmcompressor.
 
@@ -327,10 +358,17 @@ def build_calibration_from_messages(
     """
     from datasets import Dataset
 
-    rng = random.Random(seed)
     pool = list(trajectory_messages)
-    rng.shuffle(pool)
-    if num_samples and len(pool) > num_samples:
+    if shuffle:
+        rng = random.Random(seed)
+        rng.shuffle(pool)
+        if num_samples and len(pool) > num_samples:
+            pool = rng.sample(pool, num_samples)
+            print(
+                f"[calibration] randomly sampled {len(pool)}/{len(trajectory_messages)} "
+                f"trajectories (seed={seed})"
+            )
+    elif num_samples and len(pool) > num_samples:
         pool = pool[:num_samples]
 
     rows: list[dict[str, list[int]]] = []

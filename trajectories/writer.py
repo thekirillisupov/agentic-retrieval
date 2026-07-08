@@ -44,6 +44,10 @@ def trajectory_to_dict(t: Trajectory) -> dict[str, Any]:
             "completion_tokens": t.completion_tokens,
             "total_tokens": t.total_tokens,
         },
+        "latency": {
+            "llm_latencies_ms": t.llm_latencies_ms,
+            "tool_latencies_ms": [tc.latency_ms for tc in t.tool_calls],
+        },
     }
 
 

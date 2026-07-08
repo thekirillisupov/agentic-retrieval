@@ -581,6 +581,7 @@ class AgentHarness:
                 messages.append(msg)
 
         tool_call_traces: list[ToolCallTrace] = []
+        llm_latencies_ms: list[int] = []
         prompt_tokens = 0
         completion_tokens = 0
 
@@ -589,6 +590,7 @@ class AgentHarness:
         turn = 0
 
         for turn in range(1, agent_input.max_turns + 1):
+            t0 = time.perf_counter()
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[m.to_openai() for m in messages],
@@ -597,6 +599,7 @@ class AgentHarness:
                 max_tokens=self.max_tokens,
                 temperature=self.temperature,
             )
+            llm_latencies_ms.append(int((time.perf_counter() - t0) * 1000))
 
             usage = response.usage
             if usage is not None:
@@ -694,6 +697,7 @@ class AgentHarness:
             completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
             gold_doc_ids=gold_doc_ids or [],
+            llm_latencies_ms=llm_latencies_ms,
         )
 
         return AgentOutput(

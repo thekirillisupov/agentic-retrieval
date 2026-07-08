@@ -231,6 +231,8 @@ def create_app(config_path: Path) -> FastAPI:
             add_eos=emb_cfg.get("add_eos", False),
             padding_side=emb_cfg.get("padding_side"),
             device_map=emb_cfg.get("device_map"),
+            trust_remote_code=emb_cfg.get("trust_remote_code", False),
+            attn_implementation=emb_cfg.get("attn_implementation"),
         )
         State.indexes, State.default_source = _load_indexes(idx_cfg)
 

@@ -20,6 +20,7 @@ indexing/        corpus parsers (MuSiQue, SBOL) + faiss index builder
 eval_/           NDCG@k, Recall@k; single-shot baseline; agent eval; train-set builder
 trajectories/    JSON trace writer + TI/TO consistency check
 grpo/            GRPO training: data_prep, AgentLoop, reward, TI/TO check
+prune/           MoE expert pruning: router stats, plan, checkpoint rewrite, validation
 configs/         per-dataset configs (default.yaml, sbol.yaml) + grpo_qwen3_14b.yaml
 scripts/         shell wrappers for vLLM, tool server, build, eval, GRPO training
 indexes/         FAISS indexes per dataset (musique/, sbol/)
@@ -83,6 +84,20 @@ bash scripts/train_grpo.sh                     # veRL spins up its own rollout v
 
 Full design + spec→implementation map + open caveats live in
 [`GRPO_README.md`](./GRPO_README.md).
+
+## Expert pruning
+
+Structured pruning of the MoE experts, validated on the train parquet
+(routing stats on one slice, held-out NLL on another). Default candidate is
+the W8A8 quantized build; the pruned checkpoint is a drop-in for vLLM.
+
+```bash
+bash scripts/prune_experts.sh          # stats -> select -> prune -> validate
+KEEP=64 bash scripts/prune_experts.sh  # fixed experts kept per layer
+```
+
+Design, knobs and the accept gate (agent eval) live in
+[`prune/README.md`](./prune/README.md).
 
 ## Inference image
 
