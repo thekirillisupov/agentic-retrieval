@@ -49,10 +49,19 @@ def simple_recall(predicted: list[str], gold: set[str]) -> float:
 
 
 def recall_at_k(predicted: list[str], gold: set[str], k: int) -> float:
+    """Fraction of gold doc_ids found in the top-k ranked predictions."""
     if not gold:
         return 0.0
     top = set(_dedup_ranked(predicted)[:k])
     return sum(1 for g in gold if g in top) / len(gold)
+
+
+def hit_at_k(predicted: list[str], gold: set[str], k: int) -> float:
+    """1.0 if any gold doc appears in top-k, else 0.0."""
+    if not gold:
+        return 0.0
+    top = set(_dedup_ranked(predicted)[:k])
+    return 1.0 if gold & top else 0.0
 
 
 def simple_f1(precision: float, recall: float) -> float:
