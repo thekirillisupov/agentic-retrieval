@@ -1,0 +1,65 @@
+# MuSiQue dialogue eval (200-query stratified sample).
+# Prereq: sample data + musique index up:
+#   .venv/bin/python -m indexing.sample_musique_dialogs --train-size 2000 --eval-size 200
+#   GPUS=3 CONFIG=configs/musique.yaml bash scripts/serve_tool.sh
+#   bash scripts/serve_vllm.sh   # or point vllm_url at a running server
+#
+# Run:
+#   CONFIG=configs/musique_dialogs.yaml \
+#     OUT_DIR=data/processed/musique_dialogs \
+#     MODEL_NAME=checkpoints/quantized/qwen3_5_35b_a3b_w8a8 \
+#     bash scripts/run_eval.sh
+#
+# Questions are already <client>/<bot> dialogues — do NOT pass --wrap-client.
+model:
+  name: Qwen/Qwen3.5-35B-A3B
+  vllm_url: http://localhost:8000/v1
+  api_key: EMPTY
+  max_tokens: 12000
+  temperature: 0.1
+
+tool_server:
+  url: http://localhost:8100
+  timeout_s: 30
+  host: 0.0.0.0
+  port: 8100
+
+embedder:
+  name: BAAI/bge-m3
+  dim: 1024
+  device: cuda:0
+  batch_size: 32
+  max_length: 8192
+  query_prefix: ""
+  passage_prefix: ""
+  pooling: "cls"
+
+index:
+  dir: ./indexes/musique/
+  top_k_default: 8
+  top_k_max: 50
+  use_gpu: false
+  gpu_id: 3
+  cache_size: 10000
+  default_source: musique
+
+agent:
+  max_turns: 8
+  max_tool_calls: 10
+  prompt_version: v2_search_only
+  use_id_map: true
+  tool_budget_feedback: true
+  max_tool_response_length: 0
+  tool_response_truncate_side: left
+  max_passage_tokens: 0
+
+eval:
+  processed_dir: ./data/processed/musique_dialogs/
+  eval_dataset_path: ./data/processed/musique_dialogs/musique_dialog_eval.jsonl
+  subset_size: 200
+  budget_sweep: [1, 3, 5, 8]
+  ndcg_k: 10
+
+trajectories:
+  output_dir: ./trajectories_data/musique_dialogs/
+  ti_to_check_every_n: 20
