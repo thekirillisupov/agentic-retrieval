@@ -32,3 +32,6 @@ nohup.out
 gigachat/
 data/
 search_configs/
+# Fetched at serve time, pinned to the local vLLM version — do not vendor
+# (a committed copy would risk a train/inference token mismatch).
+scripts/chat_templates/

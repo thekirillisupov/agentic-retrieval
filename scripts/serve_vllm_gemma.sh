@@ -19,19 +19,29 @@
 # parsing and the final answer clean.
 #
 # The chat template lives in the vLLM source tree (examples/), which pip does not
-# always install. Point CHAT_TEMPLATE at it explicitly if auto-resolution fails:
+# always install. If it isn't found locally this script fetches the version-matched
+# copy via scripts/fetch_gemma_chat_template.sh. Point CHAT_TEMPLATE at it
+# explicitly to skip auto-resolution:
 #   CHAT_TEMPLATE=/path/to/vllm/examples/tool_chat_template_gemma4.jinja \
 #     bash scripts/serve_vllm_gemma.sh
 #
 # Usage: bash scripts/serve_vllm_gemma.sh
 set -euo pipefail
 
+HERE="$(cd "$(dirname "$0")" && pwd)"
 export MODEL="${MODEL:-google/gemma-4-26B-A4B-it}"
 export TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-gemma4}"
 export REASONING_PARSER="${REASONING_PARSER:-gemma4}"
 export ENABLE_THINKING="${ENABLE_THINKING:-false}"
 
-# Locate examples/tool_chat_template_gemma4.jinja unless CHAT_TEMPLATE is given.
+# Resolve tool_chat_template_gemma4.jinja unless CHAT_TEMPLATE is given:
+#   1. the cached copy from a previous fetch, then
+#   2. examples/ inside the installed vLLM, else
+#   3. fetch the version-matched copy (fetch_gemma_chat_template.sh).
+CACHED="${HERE}/chat_templates/tool_chat_template_gemma4.jinja"
+if [[ -z "${CHAT_TEMPLATE:-}" && -f "${CACHED}" ]]; then
+  CHAT_TEMPLATE="${CACHED}"
+fi
 if [[ -z "${CHAT_TEMPLATE:-}" ]]; then
   CHAT_TEMPLATE="$(python - <<'PY' 2>/dev/null || true
 import importlib.util, os
@@ -47,10 +57,14 @@ if spec and spec.origin:
 PY
 )"
 fi
-if [[ -z "${CHAT_TEMPLATE}" ]]; then
-  echo "ERROR: could not locate tool_chat_template_gemma4.jinja under the vLLM" >&2
-  echo "       install. Set CHAT_TEMPLATE=/path/to/examples/tool_chat_template_gemma4.jinja" >&2
-  echo "       (from the vLLM source tree that matches your installed version)." >&2
+if [[ -z "${CHAT_TEMPLATE:-}" ]]; then
+  echo "[serve_vllm_gemma] template not found locally; fetching version-matched copy…" >&2
+  CHAT_TEMPLATE="$(bash "${HERE}/fetch_gemma_chat_template.sh")" || true
+fi
+if [[ -z "${CHAT_TEMPLATE}" || ! -f "${CHAT_TEMPLATE}" ]]; then
+  echo "ERROR: could not obtain tool_chat_template_gemma4.jinja. Either set" >&2
+  echo "       CHAT_TEMPLATE=/path/to/examples/tool_chat_template_gemma4.jinja, or run" >&2
+  echo "       bash scripts/fetch_gemma_chat_template.sh  (needs network to GitHub)." >&2
   exit 1
 fi
 export CHAT_TEMPLATE
