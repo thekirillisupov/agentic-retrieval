@@ -1,0 +1,80 @@
+# CKR per-doc-filtered eval with google/gemma-4-26B-A4B-it as the generator
+# (same ckr index, different gold labels). Same embedder / index / gold labels
+# as configs/ckr_per_doc_filtered.yaml — only the actor changes, so numbers are
+# comparable to the Qwen run. The retrieval embedder is independent of the generator.
+# Prereq: GPUS=0 CONFIG=configs/unioned.yaml bash scripts/serve_tool.sh
+#         bash scripts/export_ckr_eval.sh
+#         bash scripts/serve_vllm_gemma.sh   # gemma4 tool + reasoning parser
+# Run:    CONFIG=configs/ckr_per_doc_filtered_gemma.yaml \
+#           OUT_DIR=data/processed/ckr_per_doc_filtered_gemma \
+#           bash scripts/run_eval.sh
+model:
+  name: google/gemma-4-26B-A4B-it
+  vllm_url: http://localhost:8000/v1
+  api_key: EMPTY
+  max_tokens: 4096
+  temperature: 0.6
+
+tool_server:
+  url: http://localhost:8100
+  timeout_s: 30
+  host: 0.0.0.0
+  port: 8100
+
+embedder:
+  name: ai-sage/Giga-Embeddings-instruct
+  dim: 2048
+  device: cuda:0
+  batch_size: 16
+  max_length: 4096
+  pooling: "latent_attention"
+  trust_remote_code: true
+  # flash_attention_2 needs the `flash-attn` package built against this env's
+  # torch/CUDA; omit attn_implementation to fall back to eager/sdpa attention.
+  dtype: "bfloat16"
+  query_prefix: "Instruct: Given a search query, retrieve relevant passages that answer the query\nQuery: "
+  passage_prefix: ""
+
+index:
+  top_k_default: 8
+  top_k_max: 50
+  use_gpu: false
+  cache_size: 10000
+  default_source: ckr
+  sources:
+    ckr:
+      dir: ./indexes/giga/ckr_index/
+
+reranker:
+  enable: false
+  url: http://localhost:8200/v1/rerank
+  model: Qwen/Qwen3-Reranker-4B
+  candidates: 8
+  timeout_s: 30
+
+agent:
+  max_turns: 8
+  max_tool_calls: 3
+  prompt_version: v2
+  # Replace doc_ids with small per-episode integers (0,1,2… by first
+  # appearance) in tool output; the model answers with ints and the harness
+  # maps them back to doc_ids for NDCG. Independent of prompt_version.
+  use_id_map: true
+  # Kept identical to configs/ckr_per_doc_filtered.yaml so the gemma run is
+  # directly comparable to the Qwen run (these mirror the Qwen training rollout;
+  # gemma-4-it here is evaluated off-the-shelf, not trained with this harness).
+  tool_budget_feedback: true
+  max_tool_response_length: 10240
+  tool_response_truncate_side: left
+  # Per-passage token cap (training used 512 via agent_loop.retrieval_react.
+  # max_passage_tokens). Enabling requires model.tokenizer_path; 0 disables.
+  max_passage_tokens: 0
+
+eval:
+  processed_dir: ./data/processed/ckr_per_doc_filtered/
+  eval_dataset_path: ./data/processed/ckr_per_doc_filtered/eval.jsonl
+  ndcg_k: 16
+
+trajectories:
+  output_dir: ./trajectories_data/
+  ti_to_check_every_n: 20
